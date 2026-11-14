@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createTracker, makeGeminiFunctions } = require('../gemini_conversation');
+const { createTracker, makeGeminiFunctions, verifyExtractions } = require('../gemini_conversation');
 const { getRecordSchema } = require('../alignment_history');
 
 test('inicia sessão com detecção contextual e ignora conversa sem relação', async () => {
@@ -52,16 +52,33 @@ test('envia anexo ao Gemini junto do nome do grupo, legenda e esquema da planilh
   let payload;
   global.fetch = async (_url, options) => {
     payload = JSON.parse(options.body);
-    return { ok: true, json: async () => ({candidates:[{content:{parts:[{text:'{"summary":"DG1; medição axial horizontal 0,02 mm"}'}]}}]}) };
+    return { ok: true, json: async () => ({candidates:[{content:{parts:[{text:JSON.stringify({records:[
+      {vessel:'BRAM Atlas', equipment:'DG1', facts:[{field:'Axial Horizontal', value:'0,02 mm', evidence:'Figura 2, p. 3'}]},
+      {vessel:'BRAM Atlas', equipment:'DG2', facts:[]}
+    ]})}]}}]}) };
   };
   try {
     const gemini = makeGeminiFunctions({apiKey:'test', config:{}, getRecordSchema:async () => [{title:'Axial Horizontal'}]});
     const summary = await gemini.inspectAttachment({caption:'Relatório final', groupName:'BRAM Atlas', fileName:'relatorio.pdf', mimeType:'application/pdf', data:Buffer.from('pdf')});
     assert.match(summary, /DG1/);
+    assert.match(summary, /DG2/);
+    assert.match(summary, /Documento: relatorio.pdf/);
     assert.equal(payload.contents[0].parts[1].inline_data.mime_type, 'application/pdf');
     assert.match(payload.contents[0].parts[0].text, /BRAM Atlas/);
     assert.match(payload.contents[0].parts[0].text, /Axial Horizontal/);
   } finally { global.fetch = original; }
+});
+
+test('valida quatro registros independentes sem exigir todos os campos', () => {
+  const transcript = [{text:'[Grupo: BRAM Breeze] Relatório: Diesel Generator #1, #2, #3 e #4; GAP #3 31,00 mm'}];
+  const evidence = value => ({ value, message:1, quote: transcript[0].text });
+  const records = [1,2,3,4].map(n => ({status:'incomplete', vessel:evidence('BRAM Breeze'),
+    equipment:evidence(`#${n}`), fields:n === 3 ? {coupling_gap:evidence('31,00 mm')} : {}}));
+  const checked = verifyExtractions({records}, transcript);
+  assert.equal(checked.length, 4);
+  assert.ok(checked.every(record => record.ok));
+  assert.equal(checked[2].fields['Coupling gap'], '31,00 mm');
+  assert.deepEqual(checked[0].fields, {});
 });
 
 
