@@ -7,7 +7,9 @@ Bot de WhatsApp que acompanha grupos continuamente, reconhece conversas sobre al
 - As conversas são mantidas separadas por grupo e ficam abertas para resultados que cheguem horas depois.
 - O Gemini considera o texto, o título do grupo, a taxonomia, o glossário e as combinações de máquinas da planilha de configuração.
 - Anexos JPEG, PNG, WebP e PDF são baixados em memória e enviados ao Gemini para leitura. Anexos acima de 20 MB ou em formatos não suportados são sinalizados para revisão. O conteúdo binário não é salvo na sessão; o resumo extraído é.
+- Se a leitura de um anexo falhar ou vier vazia, o arquivo é preservado em `failed-attachments/` com acesso restrito e a ocorrência é registrada em `pending-alignment.jsonl`. Acompanhe essas pendências para recuperar o documento; o bot registra nos logs apenas metadados do anexo e o tamanho do resumo, sem expor seu conteúdo.
 - A cada cinco minutos, o Gemini compara as mensagens e relatórios da sessão com os cabeçalhos da aba `Modelo alinhamento` e sincroniza uma linha. A primeira gravação preenche campos ausentes com `não informado`; sincronizações seguintes completam células ainda desconhecidas.
+- Sessões sem mensagens novas não são reprocessadas a cada ciclo; falhas transitórias são tentadas novamente no próximo ciclo.
 - Novos equipamentos iniciam uma atividade separada quando o Gemini consegue distingui-los. Se um dado posterior entrar em conflito com um valor já registrado, a linha preserva o valor comprovado, preenche outros campos ainda desconhecidos e sinaliza o conflito para revisão.
 - Tolerâncias e medições são extraídas separadamente. O código não calcula valores nem conclui aceitabilidade sem dados compatíveis.
 - Quando embarcação ou equipamento não podem ser associados com segurança, o bot ainda registra os demais dados com `não informado` na identidade ausente e cria uma pendência em `pending-alignment.jsonl` para esclarecimento. Não há perguntas automáticas no WhatsApp.
