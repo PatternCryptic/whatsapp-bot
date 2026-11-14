@@ -33,4 +33,19 @@ test('recebe PDF no grupo e entrega o conteúdo ao rastreador', async () => {
   assert.equal(inspected.fileName, 'relatorio.pdf');
   assert.equal(inspected.groupName, 'BRAM Breeze');
   assert.match(tracked.text, /DG1 resultado 0,02 mm/);
+
+  let archived;
+  let pending;
+  gemini.inspectAttachment = async () => '';
+  mocks.fs.mkdirSync = () => {};
+  mocks.fs.chmodSync = () => {};
+  mocks.fs.appendFileSync = (_file, line) => { pending = JSON.parse(line); };
+  mocks.fs.writeFileSync = (file, data) => { if (file.endsWith('.pdf')) archived = data; };
+  await context.handle({ groupMetadata: async () => ({ subject: 'BRAM Breeze' }) }, {
+    key: { remoteJid: 'grupo@g.us', id: 'test2' },
+    message: { documentMessage: { mimetype: 'application/pdf', fileName: 'relatorio.pdf', caption: 'Segue relatório final' } }
+  });
+  assert.equal(pending.reason, 'Gemini retornou resumo vazio para o anexo');
+  assert.equal(archived.toString(), 'pdf');
+  assert.doesNotMatch(tracked.text, /Conteúdo lido do anexo/);
 });

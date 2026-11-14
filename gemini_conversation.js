@@ -127,7 +127,11 @@ function createTracker({
     }),
     tick: () => enqueue(async () => {
       await expire(now());
-      for (const session of Object.values(sessions)) await onTick(session);
+      for (const session of Object.values(sessions)) {
+        if (session.lastAnalyzedMessageCount === session.messages.length) continue;
+        const synced = await onTick(session);
+        if (synced !== false) session.lastAnalyzedMessageCount = session.messages.length;
+      }
       await persist();
     }),
     snapshot: () => JSON.parse(JSON.stringify(sessions))
@@ -270,7 +274,7 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
       'Use o título do grupo como evidência contextual da embarcação. Use a configuração online (taxonomia, glossário e combinações) para reconhecer nomes alternativos. equipment é a identificação do conjunto alinhado, não uma classe genérica.',
       'Compare a conversa com os cabeçalhos reais da planilha a seguir. Mapeie apenas para campos que existam nesses cabeçalhos e respeite o grupo dos títulos repetidos. Cabeçalhos sem correspondência permanecem sem informação.',
       'Extraia apenas valores que as mensagens afirmam explicitamente. Mantenha tolerâncias separadas de medições. Registre medições após ajuste nas quatro direções apenas quando isso estiver explícito; medições anteriores ficam nos campos *_before. Não calcule, converta, complete, atribua autoria nem adivinhe dados ausentes.',
-      'Cada valor não nulo precisa apontar para o número da mensagem e conter uma quote literal daquela mensagem que inclua o valor. Se houver dois equipamentos, conflito, troca incerta ou evidência insuficiente, marque ambiguous ou incomplete.',
+      'Cada valor não nulo precisa apontar para o número da mensagem e conter uma quote literal daquela mensagem que inclua o valor. Use incomplete quando faltarem campos. Use ambiguous somente quando dados poderiam pertencer a atividades ou equipamentos distintos e não for seguro separá-los.',
       'Use status ready somente quando vessel, equipment e ao menos um campo de histórico estiverem claros. Use as grafias e unidades originais.',
       'MOTIVO DE FECHAMENTO: ' + reason,
       'CONFIGURAÇÃO ONLINE (referência para identificar valores canônicos; nunca invente): ' + await configContext(),
