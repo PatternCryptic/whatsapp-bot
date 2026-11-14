@@ -229,15 +229,30 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
   }
   async function inspectAttachment({ caption, groupName, fileName, mimeType, data }) {
     const result = await geminiJson(apiKey, [
-      'Leia o anexo técnico e extraia fielmente informações de alinhamento de máquinas/eixos que possam preencher a planilha.',
-      'Compare o conteúdo com os cabeçalhos informados no esquema: identifique embarcação, equipamento/tag, classe, fabricante, modelo, data, motivação, executor, método, medições, tolerâncias, folga e observações quando presentes.',
-      'Preserve números e unidades. Separe tolerâncias de medições. Não calcule, complete nem invente fatos. Retorne JSON {"summary":"texto conciso com os dados legíveis"}; se não houver dado de alinhamento, summary vazio.',
+      'Leia o documento inteiro. Primeiro identifique cada equipamento distinto que teve alinhamento. Um relatório com quatro geradores exige quatro registros separados, mesmo quando faltam medições.',
+      'Retorne JSON {"records":[{"vessel":"nome literal ou null","equipment":"tag literal","facts":[{"field":"título da coluna","value":"valor literal","evidence":"trecho literal ou identificação da figura e página"}]}]}. Se não houver atividade de alinhamento, retorne records vazio.',
+      'Para cada equipamento, compare com os cabeçalhos e extraia apenas dados associados com segurança a ele. Inclua GAP final, data e resultados finais quando legíveis; se um campo não estiver claro, omita esse fato. Preserve unidades, números e sinais.',
+      'Não confunda folga de virabrequim com Coupling GAP. Não confunda medições antes/depois, tolerâncias e resultados. Não atribua executor pelo autor do documento. Não misture números de equipamentos diferentes.',
+      'Se resultados estiverem em fotos de tela, leia-os quando inequívocos e identifique figura/página; caso contrário, omita-os. A falta de alguns campos nunca elimina os demais registros.',
       'NOME DO GRUPO: ' + JSON.stringify(groupName || ''),
       'ARQUIVO: ' + JSON.stringify(fileName || ''),
       'LEGENDA: ' + JSON.stringify(caption || ''),
       'CABEÇALHOS DA PLANILHA: ' + JSON.stringify(await getRecordSchema())
     ].join('\n'), model, [{ mimeType, data }]);
-    return typeof result?.summary === 'string' ? result.summary.trim() : '';
+    const records = Array.isArray(result) ? result : result?.records;
+    if (!Array.isArray(records)) return typeof result?.summary === 'string' ? result.summary.trim() : '';
+    return records.filter(record => typeof record?.equipment === 'string' && record.equipment.trim())
+      .map(record => {
+        const lines = [
+          `Equipamento: ${record.equipment.trim()}`,
+          record.vessel ? `Embarcação: ${record.vessel}` : '',
+          fileName ? `Documento: ${fileName}` : '',
+          ...((Array.isArray(record.facts) ? record.facts : []).filter(fact =>
+            fact && typeof fact.field === 'string' && typeof fact.value === 'string' && fact.value.trim()
+          ).map(fact => `${fact.field}: ${fact.value}${fact.evidence ? ` (fonte: ${fact.evidence})` : ''}`))
+        ].filter(Boolean);
+        return lines.join('\n');
+      }).join('\n\n--- OUTRO EQUIPAMENTO ---\n\n');
   }
   async function classify(previousMessages, currentMessage) {
     const transcript = [...previousMessages, currentMessage].map((message, index) => ({
@@ -247,12 +262,12 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
       text: message.text
     }));
     const result = await geminiJson(apiKey, [
-      'Você classifica mensagens de um grupo de manutenção para registrar UMA atividade de alinhamento de eixo.',
+      'Você classifica mensagens de um grupo de manutenção que pode conter vários equipamentos por relatório.',
       'Analise a conversa inteira e classifique a mensagem atual em relação à atividade ativa.',
       'Responda somente JSON: {"decision":"related|unrelated|new_activity|uncertain"}.',
       'related: acrescenta, confirma ou corrige informação da mesma atividade/equipamento.',
       'unrelated: conversa paralela claramente sem relação com o alinhamento ativo.',
-      'new_activity: há evidência clara de novo alinhamento ou equipamento distinto (por exemplo, troca explícita de DG2 para DG4).',
+      'new_activity: há evidência clara de atividade distinta. Se a conversa ativa já contém um relatório com vários equipamentos, uma informação complementar sobre qualquer um deles é related.',
       'Inclua também como new_activity quando a conversa identificar claramente outra embarcação/MCP; se a mensagem disser que complementa ou corrige um registro anterior, não misture com o equipamento atual.',
       'uncertain: não é seguro decidir. Não misture equipamentos, não deduza nem use conhecimento externo.',
       'Se ainda não foi identificado equipamento, dados de alinhamento podem ser related. Uma mensagem ambígua deve ser uncertain.',
@@ -269,12 +284,11 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
       text: message.text
     }));
     const result = await geminiJson(apiKey, [
-      'Extraia um único registro de alinhamento de eixo a partir destas mensagens de um grupo de manutenção.',
-      'Responda somente JSON no formato: {"status":"ready|ambiguous|incomplete","vessel":{"value":"texto literal","message":1,"quote":"trecho literal"},"equipment":{"value":"texto literal","message":1,"quote":"trecho literal"},"fields":{"equipment_class":null,"maker":null,"model":null,"stationary_equipment_class":null,"stationary_maker":null,"stationary_model":null,"date":null,"motivation":null,"executor":null,"method":null,"axial_vertical":null,"axial_horizontal":null,"radial_vertical":null,"radial_horizontal":null,"coupling_gap":null,"standard":null,"axial_tolerance":null,"radial_tolerance":null,"coupling_gap_tolerance":null,"document":null,"measurement_unit":null,"axial_vertical_before":null,"axial_horizontal_before":null,"radial_vertical_before":null,"radial_horizontal_before":null}}.',
+      'Extraia um registro de alinhamento POR equipamento distinto. Responda JSON {"records":[{"status":"ready|ambiguous|incomplete","vessel":{"value":"texto literal","message":1,"quote":"trecho literal"},"equipment":{"value":"texto literal","message":1,"quote":"trecho literal"},"fields":{"equipment_class":null,"maker":null,"model":null,"stationary_equipment_class":null,"stationary_maker":null,"stationary_model":null,"date":null,"motivation":null,"executor":null,"method":null,"axial_vertical":null,"axial_horizontal":null,"radial_vertical":null,"radial_horizontal":null,"coupling_gap":null,"standard":null,"axial_tolerance":null,"radial_tolerance":null,"coupling_gap_tolerance":null,"document":null,"measurement_unit":null,"axial_vertical_before":null,"axial_horizontal_before":null,"radial_vertical_before":null,"radial_horizontal_before":null}}]}.',
       'Use o título do grupo como evidência contextual da embarcação. Use a configuração online (taxonomia, glossário e combinações) para reconhecer nomes alternativos. equipment é a identificação do conjunto alinhado, não uma classe genérica.',
       'Compare a conversa com os cabeçalhos reais da planilha a seguir. Mapeie apenas para campos que existam nesses cabeçalhos e respeite o grupo dos títulos repetidos. Cabeçalhos sem correspondência permanecem sem informação.',
       'Extraia apenas valores que as mensagens afirmam explicitamente. Mantenha tolerâncias separadas de medições. Registre medições após ajuste nas quatro direções apenas quando isso estiver explícito; medições anteriores ficam nos campos *_before. Não calcule, converta, complete, atribua autoria nem adivinhe dados ausentes.',
-      'Cada valor não nulo precisa apontar para o número da mensagem e conter uma quote literal daquela mensagem que inclua o valor. Use incomplete quando faltarem campos. Use ambiguous somente quando dados poderiam pertencer a atividades ou equipamentos distintos e não for seguro separá-los.',
+      'Cada valor não nulo precisa apontar para o número da mensagem e conter uma quote literal daquela mensagem que inclua o valor. Use incomplete quando faltarem campos. Use ambiguous somente para o registro cuja identidade ou associação for incerta. Não descarte outros equipamentos claros.',
       'Use status ready somente quando vessel, equipment e ao menos um campo de histórico estiverem claros. Use as grafias e unidades originais.',
       'MOTIVO DE FECHAMENTO: ' + reason,
       'CONFIGURAÇÃO ONLINE (referência para identificar valores canônicos; nunca invente): ' + await configContext(),
@@ -330,6 +344,12 @@ function verifyExtraction(result, transcript) {
   return { ok: true, text: input.join('\n'), vessel, equipment, fields };
 }
 
-module.exports = { createTracker, fileStore, geminiJson, makeGeminiFunctions, verifyExtraction };
+function verifyExtractions(result, transcript) {
+  const records = Array.isArray(result?.records) ? result.records : [result];
+  if (!records.length) return [{ ok: false, reason: 'nenhum registro identificado' }];
+  return records.map(record => verifyExtraction(record, transcript));
+}
+
+module.exports = { createTracker, fileStore, geminiJson, makeGeminiFunctions, verifyExtraction, verifyExtractions };
 
 
