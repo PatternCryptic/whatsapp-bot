@@ -56,4 +56,5 @@ Thumbs.db
 
 # Mensagens pendentes e cópias locais do código
 pending-alignment.jsonl
+failed-attachments/
 index.js.before-*
