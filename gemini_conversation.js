@@ -228,28 +228,39 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
     return result?.alignment === true;
   }
   async function inspectAttachment({ caption, groupName, fileName, mimeType, data }) {
+    const schema = await getRecordSchema();
     const result = await geminiJson(apiKey, [
       'Leia o documento inteiro. Primeiro identifique cada equipamento distinto que teve alinhamento. Um relatório com quatro geradores exige quatro registros separados, mesmo quando faltam medições.',
       'Retorne JSON {"records":[{"vessel":"nome literal ou null","equipment":"tag literal","facts":[{"field":"título da coluna","value":"valor literal","evidence":"trecho literal ou identificação da figura e página"}]}]}. Se não houver atividade de alinhamento, retorne records vazio.',
-      'Para cada equipamento, compare com os cabeçalhos e extraia apenas dados associados com segurança a ele. Inclua GAP final, data e resultados finais quando legíveis; se um campo não estiver claro, omita esse fato. Preserve unidades, números e sinais.',
+      'Para cada equipamento, compare com os cabeçalhos e use exatamente o título da coluna em field. Extraia GAP final, data e resultados finais quando legíveis; se um campo não estiver claro, omita esse fato. Preserve unidades, números e sinais.',
       'Não confunda folga de virabrequim com Coupling GAP. Não confunda medições antes/depois, tolerâncias e resultados. Não atribua executor pelo autor do documento. Não misture números de equipamentos diferentes.',
       'Se resultados estiverem em fotos de tela, leia-os quando inequívocos e identifique figura/página; caso contrário, omita-os. A falta de alguns campos nunca elimina os demais registros.',
       'NOME DO GRUPO: ' + JSON.stringify(groupName || ''),
       'ARQUIVO: ' + JSON.stringify(fileName || ''),
       'LEGENDA: ' + JSON.stringify(caption || ''),
-      'CABEÇALHOS DA PLANILHA: ' + JSON.stringify(await getRecordSchema())
+      'CABEÇALHOS DA PLANILHA: ' + JSON.stringify(schema)
     ].join('\n'), model, [{ mimeType, data }]);
     const records = Array.isArray(result) ? result : result?.records;
     if (!Array.isArray(records)) return typeof result?.summary === 'string' ? result.summary.trim() : '';
+    const fold = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    const validTitles = new Map(schema.filter(col => col.mappedAs?.length).map(col => [fold(col.title), col.title]));
     return records.filter(record => typeof record?.equipment === 'string' && record.equipment.trim())
       .map(record => {
+        const facts = (Array.isArray(record.facts) ? record.facts : []).flatMap(fact => {
+          if (!fact || typeof fact.field !== 'string' || typeof fact.value !== 'string' ||
+              !fact.value.trim() || typeof fact.evidence !== 'string' ||
+              !fold(fact.evidence).includes(fold(fact.value))) return [];
+          const field = fold(fact.field);
+          if (/virabrequim|pre.?gap|inicial|antes/.test(field)) return [];
+          const column = validTitles.get(field) || (/^(?:gap final|coupling gap final)$/.test(field)
+            ? validTitles.get('coupling gap') : null);
+          return column ? [`${column}: ${fact.value} (fonte: ${fact.evidence})`] : [];
+        });
         const lines = [
           `Equipamento: ${record.equipment.trim()}`,
           record.vessel ? `Embarcação: ${record.vessel}` : '',
           fileName ? `Documento: ${fileName}` : '',
-          ...((Array.isArray(record.facts) ? record.facts : []).filter(fact =>
-            fact && typeof fact.field === 'string' && typeof fact.value === 'string' && fact.value.trim()
-          ).map(fact => `${fact.field}: ${fact.value}${fact.evidence ? ` (fonte: ${fact.evidence})` : ''}`))
+          ...facts
         ].filter(Boolean);
         return lines.join('\n');
       }).join('\n\n--- OUTRO EQUIPAMENTO ---\n\n');
