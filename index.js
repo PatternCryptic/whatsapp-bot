@@ -91,7 +91,7 @@ let activeSock = null;
 let alignmentConfigPromise = null;
 const groupTitleCache = new Map();
 if (geminiEnabled) {
-  const { createTracker, fileStore, makeGeminiFunctions, verifyExtraction } = require('./gemini_conversation');
+  const { createTracker, fileStore, makeGeminiFunctions, verifyExtractions } = require('./gemini_conversation');
   const { loadAlignmentConfig } = require('./alignment_config');
   const history = require('./alignment_history');
   const store = fileStore(sessionsFile);
@@ -102,48 +102,51 @@ if (geminiEnabled) {
     config: alignmentConfigPromise,
     getRecordSchema: () => history.getRecordSchema(sheets, spreadsheetId),
     onExtract: async (session, reason, extraction, transcript) => {
-      const checked = verifyExtraction(extraction, transcript);
-      if (!checked.ok) {
-        appendPending({
-          groupJid: session.group,
-          startedAt: session.startedAt,
-          closedAt: new Date().toISOString(),
-          reason: checked.reason,
-          messages: session.messages
-        });
-        console.log('Alinhamento mantido para revisão:', checked.reason);
-        return;
+      const checkedRecords = verifyExtractions(extraction, transcript);
+      const recorded = new Set();
+      for (const checked of checkedRecords) {
+        if (!checked.ok) {
+          appendPending({ groupJid: session.group, startedAt: session.startedAt,
+            closedAt: new Date().toISOString(), reason: checked.reason, messages: session.messages });
+          console.log('Alinhamento mantido para revisão:', checked.reason);
+          continue;
+        }
+        const equipmentKey = String(checked.equipment).normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .toLowerCase().replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
+          .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
+        if (recorded.has(equipmentKey)) {
+          appendPending({ groupJid: session.group, startedAt: session.startedAt,
+            reason: `equipamento duplicado na extração: ${checked.equipment}`, messages: session.messages });
+          continue;
+        }
+        recorded.add(equipmentKey);
+        const sessionId = crypto.createHash('sha256')
+          .update(`${session.group}|${session.startedAt}|${equipmentKey}`).digest('hex').slice(0, 24);
+        const fields = checked.fields || {};
+        const result = await history.recordHistory(sheets, spreadsheetId, {
+          vessel: checked.vessel, equipment: checked.equipment,
+          class: fields['Equipment Class'], maker: fields.Maker, model: fields.Model,
+          stationary_class: fields['Stationary Equipment Class'], stationary_maker: fields['Stationary Maker'],
+          stationary_model: fields['Stationary Model'], document: fields.Document,
+          date: fields.Data, motivation: fields.Motivacao, executor: fields.Executor, method: fields.Metodo,
+          axial_vertical: fields['Axial vertical'], axial_horizontal: fields['Axial horizontal'],
+          radial_vertical: fields['Radial vertical'], radial_horizontal: fields['Radial horizontal'],
+          coupling_gap: fields['Coupling gap'], standard: fields['Padrão'],
+          axial_tolerance: fields['Axial tolerance'], radial_tolerance: fields['Radial tolerance'],
+          gap_tolerance: fields['Coupling gap tolerance'],
+          observations: Object.entries(fields).filter(([key]) => /antes do ajuste|unidade das medições/i.test(key))
+            .map(([key, value]) => `${key}: ${value}`).join('; ')
+        }, sessionId);
+        const identityNeedsClarification = checked.vessel === 'não informado' || checked.equipment === 'não informado';
+        if (!['appended', 'updated', 'duplicate'].includes(result.status) || identityNeedsClarification) {
+          appendPending({ groupJid: session.group, startedAt: session.startedAt,
+            closedAt: new Date().toISOString(), equipment: checked.equipment,
+            reason: identityNeedsClarification
+              ? { message: 'Embarcação ou equipamento não puderam ser associados com segurança; linha registrada com não informado.', result }
+              : result, messages: session.messages });
+        }
+        console.log('Registro de alinhamento:', checked.equipment, result.status);
       }
-
-      const sessionId = crypto.createHash('sha256').update(`${session.group}|${session.startedAt}`).digest('hex').slice(0, 24);
-      const fields = checked.fields || {};
-      const result = await history.recordHistory(sheets, spreadsheetId, {
-        vessel: checked.vessel, equipment: checked.equipment,
-        class: fields['Equipment Class'], maker: fields.Maker, model: fields.Model,
-        stationary_class: fields['Stationary Equipment Class'], stationary_maker: fields['Stationary Maker'],
-        stationary_model: fields['Stationary Model'], document: fields.Document,
-        date: fields.Data, motivation: fields.Motivacao, executor: fields.Executor, method: fields.Metodo,
-        axial_vertical: fields['Axial vertical'], axial_horizontal: fields['Axial horizontal'],
-        radial_vertical: fields['Radial vertical'], radial_horizontal: fields['Radial horizontal'],
-        coupling_gap: fields['Coupling gap'], standard: fields['Padrão'],
-        axial_tolerance: fields['Axial tolerance'], radial_tolerance: fields['Radial tolerance'],
-        gap_tolerance: fields['Coupling gap tolerance'],
-        observations: Object.entries(fields).filter(([key]) => /antes do ajuste|unidade das medições|Coupling gap/i.test(key))
-          .map(([key, value]) => `${key}: ${value}`).join('; ')
-      }, sessionId);
-      const identityNeedsClarification = checked.vessel === 'não informado' || checked.equipment === 'não informado';
-      if (!['appended', 'updated', 'duplicate'].includes(result.status) || identityNeedsClarification) {
-        appendPending({
-          groupJid: session.group,
-          startedAt: session.startedAt,
-          closedAt: new Date().toISOString(),
-          reason: identityNeedsClarification
-            ? { message: 'Embarcação ou equipamento não puderam ser associados com segurança; a linha foi registrada com não informado.', result }
-            : result,
-          messages: session.messages
-        });
-      }
-      console.log('Registro de alinhamento:', result.status);
     }
   });
 
