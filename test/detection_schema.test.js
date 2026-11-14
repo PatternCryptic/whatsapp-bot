@@ -53,15 +53,19 @@ test('envia anexo ao Gemini junto do nome do grupo, legenda e esquema da planilh
   global.fetch = async (_url, options) => {
     payload = JSON.parse(options.body);
     return { ok: true, json: async () => ({candidates:[{content:{parts:[{text:JSON.stringify({records:[
-      {vessel:'BRAM Atlas', equipment:'DG1', facts:[{field:'Axial Horizontal', value:'0,02 mm', evidence:'Figura 2, p. 3'}]},
+      {vessel:'BRAM Atlas', equipment:'DG1', facts:[
+        {field:'Axial Horizontal', value:'0,02 mm', evidence:'Figura 2, p. 3: 0,02 mm'},
+        {field:'Folga do virabrequim', value:'0,24 mm', evidence:'Figura 3: folga do virabrequim 0,24 mm'}]},
       {vessel:'BRAM Atlas', equipment:'DG2', facts:[]}
     ]})}]}}]}) };
   };
   try {
-    const gemini = makeGeminiFunctions({apiKey:'test', config:{}, getRecordSchema:async () => [{title:'Axial Horizontal'}]});
+    const gemini = makeGeminiFunctions({apiKey:'test', config:{}, getRecordSchema:async () => [{title:'Axial Horizontal',mappedAs:['axial_horizontal']}]});
     const summary = await gemini.inspectAttachment({caption:'Relatório final', groupName:'BRAM Atlas', fileName:'relatorio.pdf', mimeType:'application/pdf', data:Buffer.from('pdf')});
     assert.match(summary, /DG1/);
     assert.match(summary, /DG2/);
+    assert.match(summary, /Axial Horizontal: 0,02 mm/);
+    assert.doesNotMatch(summary, /Folga do virabrequim/);
     assert.match(summary, /Documento: relatorio.pdf/);
     assert.equal(payload.contents[0].parts[1].inline_data.mime_type, 'application/pdf');
     assert.match(payload.contents[0].parts[0].text, /BRAM Atlas/);
