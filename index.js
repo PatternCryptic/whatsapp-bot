@@ -4,6 +4,7 @@ const { google } = require('googleapis');
 google.options({ fetchImplementation: fetch });
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const P = require('pino');
 
 const spreadsheetId = process.env.SPREADSHEET_ID;
@@ -32,6 +33,7 @@ const sheets = google.sheets({ version: 'v4', auth });
 const seenFile = path.join(__dirname, 'processed-message-ids.json');
 const sessionsFile = path.join(__dirname, 'alignment-sessions.json');
 const pendingFile = path.join(__dirname, 'pending-alignment.jsonl');
+const failedAttachmentsDir = path.join(__dirname, 'failed-attachments');
 let seenIds = new Set();
 try {
   seenIds = new Set(JSON.parse(fs.readFileSync(seenFile, 'utf8')));
@@ -46,6 +48,19 @@ function saveSeenIds() {
 function appendPending(entry) {
   fs.appendFileSync(pendingFile, JSON.stringify(entry) + '\n', { mode: 0o600 });
   fs.chmodSync(pendingFile, 0o600);
+}
+
+function archiveFailedAttachment(groupJid, messageId, mimeType, data) {
+  if (!Buffer.isBuffer(data) || !data.length) return null;
+  const key = crypto.createHash('sha256').update(`${groupJid}|${messageId || Date.now()}`).digest('hex').slice(0, 24);
+  const extension = mimeType === 'application/pdf' ? '.pdf' : mimeType === 'image/png' ? '.png' :
+    mimeType === 'image/webp' ? '.webp' : '.jpg';
+  fs.mkdirSync(failedAttachmentsDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(failedAttachmentsDir, 0o700);
+  const file = path.join(failedAttachmentsDir, key + extension);
+  fs.writeFileSync(file, data, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  return path.relative(__dirname, file);
 }
 
 function unwrapMessage(message) {
@@ -100,7 +115,6 @@ if (geminiEnabled) {
         return;
       }
 
-      const crypto = require('crypto');
       const sessionId = crypto.createHash('sha256').update(`${session.group}|${session.startedAt}`).digest('hex').slice(0, 24);
       const fields = checked.fields || {};
       const result = await history.recordHistory(sheets, spreadsheetId, {
@@ -149,8 +163,8 @@ if (geminiEnabled) {
     // Monitoramento silencioso; dados são sincronizados periodicamente.
     onMessage: async () => {},
     onTick: async (session) => {
-      try { await gemini.finish(session, 'sincronização periódica'); }
-      catch { console.error('Falha ao sincronizar dados de alinhamento.'); }
+      try { await gemini.finish(session, 'sincronização periódica'); return true; }
+      catch (error) { console.error('Falha ao sincronizar dados de alinhamento:', error.message); return false; }
     },
     finish: async (session, reason) => {
       try {
@@ -193,6 +207,10 @@ async function handleMessage(sock, msg) {
   const messageId = msg.key.id;
   if (messageId && seenIds.has(messageId)) return;
 
+  if (!attachment && /\b(?:relat[oó]rio|report)\b/i.test(text)) {
+    console.log('Mensagem sobre relatório sem anexo reconhecido:', groupJid, messageId);
+  }
+
   if (geminiEnabled) {
     let groupName = groupTitleCache.get(groupJid)?.name || '';
     if (!groupName || Date.now() - groupTitleCache.get(groupJid).time > 60 * 60 * 1000) {
@@ -204,17 +222,33 @@ async function handleMessage(sock, msg) {
     if (attachment) {
       const mimeType = image?.mimetype || document?.mimetype || '';
       const fileName = document?.fileName || '';
+      console.log('Anexo recebido:', groupJid, messageId, mimeType, fileName);
       if (!/^image\/(jpeg|png|webp)$|^application\/pdf$/i.test(mimeType)) {
+        appendPending({ messageId, groupJid, groupName, fileName, mimeType, reason: 'formato de anexo não suportado' });
         text += `\n[Anexo ${fileName || mimeType || 'não identificado'}: formato não suportado para leitura]`;
       } else {
+        let data;
         try {
-          const data = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) });
+          data = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) });
           if (data.length > 20 * 1024 * 1024) throw new Error('Anexo excede 20 MB');
           const summary = await gemini.inspectAttachment({ caption: text, groupName, fileName, mimeType, data });
-          text = [text, summary && `Conteúdo lido do anexo: ${summary}`].filter(Boolean).join('\n');
+          if (!summary) {
+            const savedAs = archiveFailedAttachment(groupJid, messageId, mimeType, data);
+            appendPending({ messageId, groupJid, groupName, fileName, mimeType, savedAs,
+              reason: 'Gemini retornou resumo vazio para o anexo' });
+            console.error('Anexo sem dados extraídos:', groupJid, messageId, mimeType);
+            if (!text) return;
+          } else {
+            console.log('Anexo interpretado:', groupJid, messageId, summary.length);
+            text = [text, `Conteúdo lido do anexo: ${summary}`].filter(Boolean).join('\n');
+          }
         } catch (error) {
-          appendPending({ messageId: msg.key.id, groupJid, groupName, fileName, reason: `não foi possível ler o anexo: ${error.message}` });
-          console.error('Não foi possível ler um anexo da conversa.');
+          let savedAs = null;
+          try { if (data?.length <= 20 * 1024 * 1024) savedAs = archiveFailedAttachment(groupJid, messageId, mimeType, data); }
+          catch (archiveError) { console.error('Falha ao preservar anexo:', archiveError.message); }
+          appendPending({ messageId, groupJid, groupName, fileName, mimeType, savedAs,
+            reason: `não foi possível ler o anexo: ${error.message}` });
+          console.error('Não foi possível ler um anexo da conversa:', error.message);
           return;
         }
       }
