@@ -25,4 +25,19 @@ test('usa mensagens anteriores do mesmo grupo para reconhecer uma conversa conte
   assert.equal(tracker.snapshot()['grupo-a'].messages.length, 2);
 });
 
+test('sincroniza novamente quando chegam dados novos e retenta falhas transitórias', async () => {
+  let calls = 0;
+  const tracker = createTracker({ detect: async () => true, classify: async () => 'related',
+    finish: async () => {}, save: async () => {}, onTick: async () => { calls += 1; return calls === 1 ? false : true; }
+  });
+  await tracker.process({group:'g', id:'1', text:'DG1 em alinhamento'});
+  await tracker.tick();
+  await tracker.tick();
+  await tracker.tick();
+  assert.equal(calls, 2);
+  await tracker.process({group:'g', id:'2', text:'resultado 0,02 mm'});
+  await tracker.tick();
+  assert.equal(calls, 3);
+});
+
 
