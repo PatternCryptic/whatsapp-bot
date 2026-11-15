@@ -261,7 +261,9 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
               !fold(gap.evidence).includes(fold(gap.value)) ||
               !/gap/i.test(gap.evidence) || /virabrequim|pré.?gap|antes do alinhamento/i.test(gap.evidence)) continue;
           match.facts = Array.isArray(match.facts) ? match.facts : [];
-          if (!match.facts.some(fact => /^(?:coupling gap|gap final)$/i.test(fact.field))) {
+          if (!match.facts.some(fact => /^(?:coupling gap|gap final)$/i.test(fact.field) &&
+              typeof fact.value === 'string' && typeof fact.evidence === 'string' &&
+              fold(fact.evidence).includes(fold(fact.value)))) {
             match.facts.push({field:'Coupling GAP', value:gap.value,
               evidence:`${gap.evidence} (página ${gap.page || 'não indicada'})`});
           }
