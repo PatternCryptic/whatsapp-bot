@@ -71,7 +71,7 @@ test('envia anexo ao Gemini junto do nome do grupo, legenda e esquema da planilh
   const original = global.fetch;
   let payload;
   global.fetch = async (_url, options) => {
-    payload = JSON.parse(options.body);
+    payload ||= JSON.parse(options.body);
     return { ok: true, json: async () => ({candidates:[{content:{parts:[{text:JSON.stringify({records:[
       {vessel:'BRAM Atlas', equipment:'DG1', facts:[
         {field:'Axial Horizontal', value:'0,02 mm', evidence:'Figura 2, p. 3: 0,02 mm'},
@@ -91,6 +91,23 @@ test('envia anexo ao Gemini junto do nome do grupo, legenda e esquema da planilh
     assert.match(payload.contents[0].parts[0].text, /BRAM Atlas/);
     assert.match(payload.contents[0].parts[0].text, /Axial Horizontal/);
   } finally { global.fetch = original; }
+});
+
+test('lê legenda PRUFTECHNIK apenas em tela compatível e final do equipamento', async () => {
+  const original=global.fetch;
+  let calls=0;
+  global.fetch=async()=>({ok:true,json:async()=>({candidates:[{content:{parts:[{text:JSON.stringify(++calls===1
+    ? {records:[{equipment:'DG1',facts:[]},{equipment:'DG2',facts:[]}]}
+    : {records:[{equipment:'DG1',compatible:true,final:true,figure:'Figura 44, página 28',values:{'Axial Vertical':'0,01 mm','Radial Vertical':'0,18 mm','Axial Horizontal':'0,02 mm','Radial Horizontal':'0,02 mm'}},{equipment:'DG2',compatible:false,final:true,figure:'página 2',values:{'Axial Vertical':'9,99 mm'}}]})}]}}]})});
+  try {
+    const schema=['Axial Vertical','Radial Vertical','Axial Horizontal','Radial Horizontal'].map(title=>({title,mappedAs:['value']}));
+    const gemini=makeGeminiFunctions({apiKey:'test',config:{},getRecordSchema:async()=>schema});
+    const result=await gemini.inspectAttachment({mimeType:'image/jpeg',data:Buffer.from('image')});
+    assert.match(result,/Axial Vertical: 0,01 mm/);
+    assert.match(result,/Radial Vertical: 0,18 mm/);
+    assert.match(result,/Figura 44/);
+    assert.doesNotMatch(result,/9,99 mm/);
+  } finally {global.fetch=original;}
 });
 
 test('valida quatro registros independentes sem exigir todos os campos', () => {
