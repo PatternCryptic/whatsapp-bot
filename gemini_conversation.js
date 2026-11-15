@@ -244,6 +244,35 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
     if (!Array.isArray(records)) return typeof result?.summary === 'string' ? result.summary.trim() : '';
     const fold = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
     const validTitles = new Map(schema.filter(col => col.mappedAs?.length).map(col => [fold(col.title), col.title]));
+    const pictureColumns = ['Axial Vertical', 'Radial Vertical', 'Axial Horizontal', 'Radial Horizontal'];
+    if (records.length && pictureColumns.some(title => validTitles.has(fold(title)))) {
+      try {
+        const visual = await geminiJson(apiKey, [
+          'Leia resultados finais nas imagens de alinhamento. A legenda a seguir é válida somente para a tela PRUFTECHNIK que exibe dois resultados ao lado de V e dois ao lado de H, com os mesmos símbolos de angular e paralelo da referência.',
+          'Na ordem visual de cima para baixo: V superior = Axial Vertical; V inferior = Radial Vertical; H superior = Axial Horizontal; H inferior = Radial Horizontal.',
+          'Use apenas a leitura consolidada em destaque. Não use a tabela das amostras, medições de pé manco, valores antes do ajuste ou resultados de outra máquina. Não confunda os quatro valores com o GAP entre faces.',
+          'Associe cada foto ao equipamento por título e contexto do documento; se a tela, o equipamento, o resultado final, o sinal, a unidade ou um número não estiverem claros, omita o valor. Não invente.',
+          'Retorne JSON {"records":[{"equipment":"nome identificado", "compatible":true, "final":true, "figure":"figura e página ou imagem", "values":{"Axial Vertical":"0,01 mm","Radial Vertical":"0,02 mm","Axial Horizontal":null,"Radial Horizontal":null}}]}. Inclua somente o que estiver legível; se nenhuma tela compatível estiver presente retorne records vazio.',
+          'EQUIPAMENTOS: ' + JSON.stringify(records.map(record => record.equipment))
+        ].join('\n'), model, [{ mimeType, data }]);
+        const key = value => fold(value).replace(/\b(?:diesel generator|gerador diesel|grupo gerador|genset|dg)\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
+        const byEquipment = new Map(records.map(record => [key(record.equipment), record]));
+        for (const item of Array.isArray(visual?.records) ? visual.records : []) {
+          const match = byEquipment.get(key(item.equipment));
+          if (!match || item.compatible !== true || item.final !== true || typeof item.figure !== 'string' || !item.figure.trim()) continue;
+          match.facts = Array.isArray(match.facts) ? match.facts : [];
+          for (const title of pictureColumns) {
+            const value = item.values?.[title];
+            if (!validTitles.has(fold(title)) || typeof value !== 'string' || !/^[+-]?\d+[.,]\d+\s*mm$/i.test(value.trim())) continue;
+            if (match.facts.some(fact => fold(fact.field) === fold(title) && fact.value !== value)) continue;
+            if (!match.facts.some(fact => fold(fact.field) === fold(title) && fact.value === value))
+              match.facts.push({field:title, value:value.trim(), evidence:`${item.figure}: ${title} ${value.trim()}`});
+          }
+        }
+      } catch (error) {
+        console.warn('Leitura visual indisponível:', error.message);
+      }
+    }
     if (mimeType === 'application/pdf' && records.length && validTitles.has('data')) {
       try {
         const result = await geminiJson(apiKey, [
