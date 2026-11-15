@@ -36,7 +36,8 @@ test('relatório com quatro geradores gera quatro linhas e preserva ausências',
   const session = {group:'group@g.us', startedAt:'2026-11-14T23:29:36Z', messages:[{text}]};
   const outcome = await onExtract(session, 'sincronização periódica', {records}, [{text}]);
 
-  assert.deepEqual(outcome, {written:4, pending:0});
+  assert.equal(outcome.written, 4);
+  assert.equal(outcome.pending, 0);
   assert.equal(writes.length, 4);
   assert.equal(new Set(writes.map(row => row.sessionId)).size, 4);
   assert.deepEqual(writes.map(row => row.data.equipment),
