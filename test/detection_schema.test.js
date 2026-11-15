@@ -91,7 +91,8 @@ test('recupera GAP final de quatro geradores sem aceitar folga do virabrequim', 
   global.fetch = async () => {
     calls += 1;
     const result = calls === 1 ? {records:[1,2,3,4].map(n => ({
-      vessel:'BRAM BREEZE', equipment:`Diesel Generator #${n}`, facts:[]
+      vessel:'BRAM BREEZE', equipment:`Diesel Generator #${n}`,
+      facts:n === 1 ? [{field:'GAP final',value:'27,65 mm',evidence:'Figura 49'}] : []
     }))} : {records:[
       {equipment:'DG #1',coupling_gap:{value:'27,65 mm',evidence:'Figura 49 - Gap após alinhamento: 27,65 mm',page:31}},
       {equipment:'DG #2',coupling_gap:{value:'29,45 mm',evidence:'Figura 27 - Gap verificado (29,45 mm)',page:18}},
