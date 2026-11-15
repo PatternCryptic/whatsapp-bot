@@ -244,6 +244,32 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
     if (!Array.isArray(records)) return typeof result?.summary === 'string' ? result.summary.trim() : '';
     const fold = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
     const validTitles = new Map(schema.filter(col => col.mappedAs?.length).map(col => [fold(col.title), col.title]));
+    if (mimeType === 'application/pdf' && records.length > 1 && validTitles.has('coupling gap')) {
+      try {
+        const supplemental = await geminiJson(apiKey, [
+          'Examine o PDF completo. Para cada equipamento numerado, extraia a distância final do GAP do acoplamento entre motor e gerador após alinhamento, quando informada.',
+          'Nunca use folga axial do virabrequim, pré GAP nem GAP inicial. Não misture equipamentos. O trecho de evidência deve conter literalmente o valor e a unidade.',
+          'Retorne JSON {"records":[{"equipment":"nome literal","coupling_gap":{"value":"número e unidade","evidence":"citação textual com o mesmo número e unidade","page":1}}]}. Use null se não houver medida final clara.',
+          'EQUIPAMENTOS IDENTIFICADOS: ' + JSON.stringify(records.map(record => record.equipment))
+        ].join('\n'), model, [{ mimeType, data }]);
+        const key = value => fold(value).replace(/\b(?:diesel generator|gerador diesel|grupo gerador|genset|dg)\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
+        const byEquipment = new Map(records.map(record => [key(record.equipment), record]));
+        for (const item of supplemental?.records || []) {
+          const match = byEquipment.get(key(item.equipment));
+          const gap = item.coupling_gap;
+          if (!match || typeof gap?.value !== 'string' || typeof gap.evidence !== 'string' ||
+              !fold(gap.evidence).includes(fold(gap.value)) ||
+              !/gap/i.test(gap.evidence) || /virabrequim|pré.?gap|antes do alinhamento/i.test(gap.evidence)) continue;
+          match.facts = Array.isArray(match.facts) ? match.facts : [];
+          if (!match.facts.some(fact => /^(?:coupling gap|gap final)$/i.test(fact.field))) {
+            match.facts.push({field:'Coupling GAP', value:gap.value,
+              evidence:`${gap.evidence} (página ${gap.page || 'não indicada'})`});
+          }
+        }
+      } catch (error) {
+        console.warn('Leitura complementar de GAP indisponível:', error.message);
+      }
+    }
     return records.filter(record => typeof record?.equipment === 'string' && record.equipment.trim())
       .map(record => {
         const facts = (Array.isArray(record.facts) ? record.facts : []).flatMap(fact => {
