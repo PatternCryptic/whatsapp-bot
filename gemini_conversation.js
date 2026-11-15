@@ -287,7 +287,7 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
         const lines = [
           `Equipamento: ${record.equipment.trim()}`,
           record.vessel ? `Embarcação: ${record.vessel}` : '',
-          fileName ? `Documento: ${fileName}` : '',
+          fileName ? `Document: ${fileName}` : '',
           ...facts
         ].filter(Boolean);
         return lines.join('\n');
@@ -363,12 +363,12 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
 
 function verifyExtraction(result, transcript) {
   if (!result || !['ready', 'incomplete'].includes(result.status)) return { ok: false, reason: 'extração ambígua' };
+  const fold = (value) => String(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase();
   const verifiedValue = (item) => {
     if (!item || typeof item.value !== 'string' || !item.value.trim() ||
         !Number.isInteger(item.message) || item.message < 1 || item.message > transcript.length ||
         typeof item.quote !== 'string' || !item.quote.trim()) return null;
     const source = transcript[item.message - 1].text;
-    const fold = (value) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase();
     if (!source.includes(item.quote) || !fold(item.quote).includes(fold(item.value))) return null;
     return item.value.trim();
   };
@@ -376,9 +376,24 @@ function verifyExtraction(result, transcript) {
   const vessel = verifiedValue(result.vessel) || 'não informado';
   const equipment = verifiedValue(result.equipment) || 'não informado';
 
+  // Gemini por vezes simplifica um campo para string. Só aceita esse formato
+  // quando a mesma medida aparece com o cabeçalho na seção do equipamento.
+  const verifiedString = (value, label) => {
+    if (typeof value !== 'string' || !value.trim() || equipment === 'não informado') return null;
+    const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`(?:^|\\n)${escape(fold(label))}:\\s*${escape(fold(value.trim()))}(?=\\s*\\(|\\s*$)`, 'm');
+    for (const message of transcript) {
+      for (const section of String(message.text || '').split(/--- OUTRO EQUIPAMENTO ---/i)) {
+        const normalized = fold(section);
+        if (normalized.includes(`equipamento: ${fold(equipment)}`) && pattern.test(normalized)) return value.trim();
+      }
+    }
+    return null;
+  };
+
   const fields = {};
   for (const [key, label] of Object.entries(FIELD_LABELS)) {
-    const value = verifiedValue(result.fields?.[key]);
+    const value = verifiedValue(result.fields?.[key]) || verifiedString(result.fields?.[key], label);
     if (value) fields[label] = value;
   }
   const input = [`Vessel: ${vessel}`, `Equipment: ${equipment}`];
