@@ -334,7 +334,7 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
       'CABEÇALHOS E GRUPOS DA PLANILHA: ' + JSON.stringify(await getRecordSchema()),
       'MENSAGENS: ' + JSON.stringify(transcript)
     ].join('\n'), model);
-    await onExtract(session, reason, result, transcript);
+    return onExtract(session, reason, result, transcript);
   }
 
   async function ask(session) {
