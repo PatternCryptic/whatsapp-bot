@@ -244,6 +244,31 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
     if (!Array.isArray(records)) return typeof result?.summary === 'string' ? result.summary.trim() : '';
     const fold = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
     const validTitles = new Map(schema.filter(col => col.mappedAs?.length).map(col => [fold(col.title), col.title]));
+    if (mimeType === 'application/pdf' && records.length && validTitles.has('data')) {
+      try {
+        const result = await geminiJson(apiKey, [
+          'Examine o relatório inteiro e identifique o período geral de execução que abrange explicitamente os equipamentos identificados.',
+          'Retorne JSON {"period":{"value":"intervalo literal incluindo as duas datas","evidence":"trecho literal que contém o intervalo","page":1}}.',
+          'Use null quando não houver um intervalo geral explícito ou quando sua abrangência for incerta. Não use data de emissão, de criação nem atribua uma data pontual a cada equipamento.',
+          'EQUIPAMENTOS: ' + JSON.stringify(records.map(record => record.equipment))
+        ].join('\n'), model, [{ mimeType, data }]);
+        const period = result?.period;
+        if (typeof period?.value === 'string' && typeof period.evidence === 'string' &&
+            (period.value.match(/\b\d{1,2}[/.\-]\d{1,2}[/.\-]\d{4}\b/g) || []).length === 2 &&
+            fold(period.evidence).includes(fold(period.value))) {
+          for (const record of records) {
+            record.facts = Array.isArray(record.facts) ? record.facts : [];
+            if (!record.facts.some(fact => fold(fact.field) === 'data' && typeof fact.value === 'string' &&
+                typeof fact.evidence === 'string' && fold(fact.evidence).includes(fold(fact.value)))) {
+              record.facts.push({field:'Data', value:period.value,
+                evidence:`Período geral do serviço: ${period.evidence} (página ${period.page || 'não indicada'})`});
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('Leitura complementar do período indisponível:', error.message);
+      }
+    }
     if (mimeType === 'application/pdf' && records.length > 1 && validTitles.has('coupling gap')) {
       try {
         const supplemental = await geminiJson(apiKey, [

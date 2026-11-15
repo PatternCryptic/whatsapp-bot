@@ -148,4 +148,21 @@ test('aceita medida em string somente na seção correta do equipamento', () => 
   assert.equal(verified[2].fields['Coupling gap'],undefined);
 });
 
+test('registra período geral do serviço sem criar uma data para cada DG', async () => {
+  const original = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    const answer = ++calls === 1 ? {records:[1,2].map(n => ({equipment:`DG #${n}`,facts:[]}))} :
+      {period:{value:'06/08/2026 a 13/08/2026', evidence:'Trabalho executado com data de início em 06/08/2026 a 13/08/2026',page:1}};
+    return {ok:true,json:async()=>({candidates:[{content:{parts:[{text:JSON.stringify(answer)}]}}]})};
+  };
+  try {
+    const gemini=makeGeminiFunctions({apiKey:'test',config:{},
+      getRecordSchema:async()=>[{title:'Data',mappedAs:['date']}]});
+    const summary=await gemini.inspectAttachment({mimeType:'application/pdf',data:Buffer.from('pdf')});
+    assert.equal((summary.match(/Data: 06\/08\/2026 a 13\/08\/2026/g)||[]).length,2);
+    assert.match(summary,/Período geral do serviço/);
+  } finally {global.fetch=original;}
+});
+
 
