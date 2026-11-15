@@ -34,8 +34,9 @@ test('relatório com quatro geradores gera quatro linhas e preserva ausências',
   const records = [1,2,3,4].map(n => ({status:'incomplete', vessel:item('BRAM Breeze'),
     equipment:item(`Diesel Generator #${n}`), fields:n === 3 ? {coupling_gap:item('31,00 mm')} : {}}));
   const session = {group:'group@g.us', startedAt:'2026-11-14T23:29:36Z', messages:[{text}]};
-  await onExtract(session, 'sincronização periódica', {records}, [{text}]);
+  const outcome = await onExtract(session, 'sincronização periódica', {records}, [{text}]);
 
+  assert.deepEqual(outcome, {written:4, pending:0});
   assert.equal(writes.length, 4);
   assert.equal(new Set(writes.map(row => row.sessionId)).size, 4);
   assert.deepEqual(writes.map(row => row.data.equipment),
