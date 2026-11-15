@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createTracker, makeGeminiFunctions } = require('../gemini_conversation');
+const { createTracker, makeGeminiFunctions, verifyExtractions } = require('../gemini_conversation');
 const { getRecordSchema } = require('../alignment_history');
 
 test('inicia sessão com detecção contextual e ignora conversa sem relação', async () => {
@@ -52,15 +52,64 @@ test('envia anexo ao Gemini junto do nome do grupo, legenda e esquema da planilh
   let payload;
   global.fetch = async (_url, options) => {
     payload = JSON.parse(options.body);
-    return { ok: true, json: async () => ({candidates:[{content:{parts:[{text:'{"summary":"DG1; medição axial horizontal 0,02 mm"}'}]}}]}) };
+    return { ok: true, json: async () => ({candidates:[{content:{parts:[{text:JSON.stringify({records:[
+      {vessel:'BRAM Atlas', equipment:'DG1', facts:[
+        {field:'Axial Horizontal', value:'0,02 mm', evidence:'Figura 2, p. 3: 0,02 mm'},
+        {field:'Folga do virabrequim', value:'0,24 mm', evidence:'Figura 3: folga do virabrequim 0,24 mm'}]},
+      {vessel:'BRAM Atlas', equipment:'DG2', facts:[]}
+    ]})}]}}]}) };
   };
   try {
-    const gemini = makeGeminiFunctions({apiKey:'test', config:{}, getRecordSchema:async () => [{title:'Axial Horizontal'}]});
+    const gemini = makeGeminiFunctions({apiKey:'test', config:{}, getRecordSchema:async () => [{title:'Axial Horizontal',mappedAs:['axial_horizontal']}]});
     const summary = await gemini.inspectAttachment({caption:'Relatório final', groupName:'BRAM Atlas', fileName:'relatorio.pdf', mimeType:'application/pdf', data:Buffer.from('pdf')});
     assert.match(summary, /DG1/);
+    assert.match(summary, /DG2/);
+    assert.match(summary, /Axial Horizontal: 0,02 mm/);
+    assert.doesNotMatch(summary, /Folga do virabrequim/);
+    assert.match(summary, /Documento: relatorio.pdf/);
     assert.equal(payload.contents[0].parts[1].inline_data.mime_type, 'application/pdf');
     assert.match(payload.contents[0].parts[0].text, /BRAM Atlas/);
     assert.match(payload.contents[0].parts[0].text, /Axial Horizontal/);
+  } finally { global.fetch = original; }
+});
+
+test('valida quatro registros independentes sem exigir todos os campos', () => {
+  const transcript = [{text:'[Grupo: BRAM Breeze] Relatório: Diesel Generator #1, #2, #3 e #4; GAP #3 31,00 mm'}];
+  const evidence = value => ({ value, message:1, quote: transcript[0].text });
+  const records = [1,2,3,4].map(n => ({status:'incomplete', vessel:evidence('BRAM Breeze'),
+    equipment:evidence(`#${n}`), fields:n === 3 ? {coupling_gap:evidence('31,00 mm')} : {}}));
+  const checked = verifyExtractions({records}, transcript);
+  assert.equal(checked.length, 4);
+  assert.ok(checked.every(record => record.ok));
+  assert.equal(checked[2].fields['Coupling gap'], '31,00 mm');
+  assert.deepEqual(checked[0].fields, {});
+});
+
+test('recupera GAP final de quatro geradores sem aceitar folga do virabrequim', async () => {
+  const original = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    const result = calls === 1 ? {records:[1,2,3,4].map(n => ({
+      vessel:'BRAM BREEZE', equipment:`Diesel Generator #${n}`,
+      facts:n === 1 ? [{field:'GAP final',value:'27,65 mm',evidence:'Figura 49'}] : []
+    }))} : {records:[
+      {equipment:'DG #1',coupling_gap:{value:'27,65 mm',evidence:'Figura 49 - Gap após alinhamento: 27,65 mm',page:31}},
+      {equipment:'DG #2',coupling_gap:{value:'29,45 mm',evidence:'Figura 27 - Gap verificado (29,45 mm)',page:18}},
+      {equipment:'DG #3',coupling_gap:{value:'0,24 mm',evidence:'Folga do virabrequim 0,24 mm',page:13}},
+      {equipment:'DG #4',coupling_gap:{value:'27,87 mm',evidence:'Figura 39 - Gap final: 27,87 mm',page:25}}
+    ]};
+    return {ok:true,json:async () => ({candidates:[{content:{parts:[{text:JSON.stringify(result)}]}}]})};
+  };
+  try {
+    const gemini = makeGeminiFunctions({apiKey:'test', config:{},
+      getRecordSchema:async () => [{title:'Coupling GAP',mappedAs:['coupling_gap']}]});
+    const text = await gemini.inspectAttachment({mimeType:'application/pdf',data:Buffer.from('pdf'),fileName:'report.pdf'});
+    assert.equal(calls, 2);
+    assert.match(text, /Diesel Generator #1[\s\S]*Coupling GAP: 27,65 mm/);
+    assert.match(text, /Diesel Generator #2[\s\S]*Coupling GAP: 29,45 mm/);
+    assert.doesNotMatch(text, /0,24 mm/);
+    assert.match(text, /Diesel Generator #4[\s\S]*Coupling GAP: 27,87 mm/);
   } finally { global.fetch = original; }
 });
 

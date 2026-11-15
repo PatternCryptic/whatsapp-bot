@@ -91,7 +91,7 @@ let activeSock = null;
 let alignmentConfigPromise = null;
 const groupTitleCache = new Map();
 if (geminiEnabled) {
-  const { createTracker, fileStore, makeGeminiFunctions, verifyExtraction } = require('./gemini_conversation');
+  const { createTracker, fileStore, makeGeminiFunctions, verifyExtractions } = require('./gemini_conversation');
   const { loadAlignmentConfig } = require('./alignment_config');
   const history = require('./alignment_history');
   const store = fileStore(sessionsFile);
@@ -102,48 +102,57 @@ if (geminiEnabled) {
     config: alignmentConfigPromise,
     getRecordSchema: () => history.getRecordSchema(sheets, spreadsheetId),
     onExtract: async (session, reason, extraction, transcript) => {
-      const checked = verifyExtraction(extraction, transcript);
-      if (!checked.ok) {
-        appendPending({
-          groupJid: session.group,
-          startedAt: session.startedAt,
-          closedAt: new Date().toISOString(),
-          reason: checked.reason,
-          messages: session.messages
-        });
-        console.log('Alinhamento mantido para revisão:', checked.reason);
-        return;
+      const checkedRecords = verifyExtractions(extraction, transcript);
+      const recorded = new Set();
+      let written = 0;
+      let pending = 0;
+      for (const checked of checkedRecords) {
+        if (!checked.ok) {
+          pending += 1;
+          appendPending({ groupJid: session.group, startedAt: session.startedAt,
+            closedAt: new Date().toISOString(), reason: checked.reason, messages: session.messages });
+          console.log('Alinhamento mantido para revisão:', checked.reason);
+          continue;
+        }
+        const equipmentKey = String(checked.equipment).normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          .toLowerCase().replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
+          .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
+        if (recorded.has(equipmentKey)) {
+          pending += 1;
+          appendPending({ groupJid: session.group, startedAt: session.startedAt,
+            reason: `equipamento duplicado na extração: ${checked.equipment}`, messages: session.messages });
+          continue;
+        }
+        recorded.add(equipmentKey);
+        const sessionId = crypto.createHash('sha256')
+          .update(`${session.group}|${session.startedAt}|${equipmentKey}`).digest('hex').slice(0, 24);
+        const fields = checked.fields || {};
+        const result = await history.recordHistory(sheets, spreadsheetId, {
+          vessel: checked.vessel, equipment: checked.equipment,
+          class: fields['Equipment Class'], maker: fields.Maker, model: fields.Model,
+          stationary_class: fields['Stationary Equipment Class'], stationary_maker: fields['Stationary Maker'],
+          stationary_model: fields['Stationary Model'], document: fields.Document,
+          date: fields.Data, motivation: fields.Motivacao, executor: fields.Executor, method: fields.Metodo,
+          axial_vertical: fields['Axial vertical'], axial_horizontal: fields['Axial horizontal'],
+          radial_vertical: fields['Radial vertical'], radial_horizontal: fields['Radial horizontal'],
+          coupling_gap: fields['Coupling gap'], standard: fields['Padrão'],
+          axial_tolerance: fields['Axial tolerance'], radial_tolerance: fields['Radial tolerance'],
+          gap_tolerance: fields['Coupling gap tolerance'],
+          observations: Object.entries(fields).filter(([key]) => /antes do ajuste|unidade das medições/i.test(key))
+            .map(([key, value]) => `${key}: ${value}`).join('; ')
+        }, sessionId);
+        if (['appended', 'updated', 'duplicate', 'conflict'].includes(result.status)) written += 1;
+        const identityNeedsClarification = checked.vessel === 'não informado' || checked.equipment === 'não informado';
+        if (!['appended', 'updated', 'duplicate'].includes(result.status) || identityNeedsClarification) {
+          appendPending({ groupJid: session.group, startedAt: session.startedAt,
+            closedAt: new Date().toISOString(), equipment: checked.equipment,
+            reason: identityNeedsClarification
+              ? { message: 'Embarcação ou equipamento não puderam ser associados com segurança; linha registrada com não informado.', result }
+              : result, messages: session.messages });
+        }
+        console.log('Registro de alinhamento:', checked.equipment, result.status);
       }
-
-      const sessionId = crypto.createHash('sha256').update(`${session.group}|${session.startedAt}`).digest('hex').slice(0, 24);
-      const fields = checked.fields || {};
-      const result = await history.recordHistory(sheets, spreadsheetId, {
-        vessel: checked.vessel, equipment: checked.equipment,
-        class: fields['Equipment Class'], maker: fields.Maker, model: fields.Model,
-        stationary_class: fields['Stationary Equipment Class'], stationary_maker: fields['Stationary Maker'],
-        stationary_model: fields['Stationary Model'], document: fields.Document,
-        date: fields.Data, motivation: fields.Motivacao, executor: fields.Executor, method: fields.Metodo,
-        axial_vertical: fields['Axial vertical'], axial_horizontal: fields['Axial horizontal'],
-        radial_vertical: fields['Radial vertical'], radial_horizontal: fields['Radial horizontal'],
-        coupling_gap: fields['Coupling gap'], standard: fields['Padrão'],
-        axial_tolerance: fields['Axial tolerance'], radial_tolerance: fields['Radial tolerance'],
-        gap_tolerance: fields['Coupling gap tolerance'],
-        observations: Object.entries(fields).filter(([key]) => /antes do ajuste|unidade das medições|Coupling gap/i.test(key))
-          .map(([key, value]) => `${key}: ${value}`).join('; ')
-      }, sessionId);
-      const identityNeedsClarification = checked.vessel === 'não informado' || checked.equipment === 'não informado';
-      if (!['appended', 'updated', 'duplicate'].includes(result.status) || identityNeedsClarification) {
-        appendPending({
-          groupJid: session.group,
-          startedAt: session.startedAt,
-          closedAt: new Date().toISOString(),
-          reason: identityNeedsClarification
-            ? { message: 'Embarcação ou equipamento não puderam ser associados com segurança; a linha foi registrada com não informado.', result }
-            : result,
-          messages: session.messages
-        });
-      }
-      console.log('Registro de alinhamento:', result.status);
+      return {written, pending};
     }
   });
 
@@ -319,11 +328,53 @@ async function startBot() {
   });
 }
 
+async function recoverAttachment(savedAs) {
+  if (!geminiEnabled) throw new Error('Recuperação requer Gemini ativo.');
+  const resolved = path.resolve(__dirname, String(savedAs || ''));
+  if (!resolved.startsWith(path.resolve(failedAttachmentsDir) + path.sep)) {
+    throw new Error('Arquivo de recuperação deve estar em failed-attachments/.');
+  }
+  const entries = fs.readFileSync(pendingFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const entry = entries.find(item => item.savedAs === path.relative(__dirname, resolved) && item.groupJid && item.mimeType);
+  if (!entry) throw new Error('Anexo não encontrado no registro de pendências.');
+  const data = fs.readFileSync(resolved);
+  await alignmentConfigPromise;
+  const summary = await gemini.inspectAttachment({
+    caption:'', groupName:entry.groupName, fileName:entry.fileName, mimeType:entry.mimeType, data
+  });
+  if (!summary) throw new Error('Gemini ainda retornou extração vazia; arquivo mantido para revisão.');
+  const store = require('./gemini_conversation').fileStore(sessionsFile);
+  const sessions = store.load();
+  const timestamp = fs.statSync(resolved).mtime.toISOString();
+  const session = sessions[entry.groupJid] || {
+    group:entry.groupJid, startedAt:timestamp, lastRelated:Date.now(), messages:[]
+  };
+  if (!session.messages.some(message => message.id === entry.messageId)) {
+    session.messages.push({group:entry.groupJid, id:entry.messageId, timestamp,
+      sender:'', groupName:entry.groupName,
+      text:`[Grupo: ${entry.groupName || ''}]\nConteúdo lido do anexo: ${summary}`});
+  }
+  const outcome = await gemini.finish(session, 'recuperação de anexo');
+  const expected = (summary.match(/^Equipamento:/gm) || []).length;
+  if (!outcome || outcome.written < expected || outcome.pending) {
+    throw new Error(`Extração parcial: ${outcome?.written || 0}/${expected} linhas; arquivo mantido para revisão.`);
+  }
+  session.lastAnalyzedMessageCount = session.messages.length;
+  sessions[entry.groupJid] = session;
+  store.save(sessions);
+  if (entry.messageId) { seenIds.add(entry.messageId); saveSeenIds(); }
+  appendPending({messageId:entry.messageId, savedAs:entry.savedAs,
+    recoveredAt:new Date().toISOString(), reason:'anexo recuperado e sincronizado'});
+  console.log('Anexo recuperado e sincronizado:', entry.savedAs);
+}
+
 process.on('SIGINT', () => process.exit(0));
 process.on('SIGTERM', () => process.exit(0));
 
 console.log('Iniciando coletor silencioso de mensagens de alinhamento...');
-startBot().catch((error) => {
+const operation = process.argv[2] === '--recover-attachment'
+  ? recoverAttachment(process.argv[3]) : startBot();
+operation.catch((error) => {
   console.error('Não foi possível iniciar o coletor:', error.message);
   process.exit(1);
 });
