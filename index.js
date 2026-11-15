@@ -349,11 +349,11 @@ async function recoverAttachment(savedAs) {
   const session = sessions[entry.groupJid] || {
     group:entry.groupJid, startedAt:timestamp, lastRelated:Date.now(), messages:[]
   };
-  if (!session.messages.some(message => message.id === entry.messageId)) {
-    session.messages.push({group:entry.groupJid, id:entry.messageId, timestamp,
-      sender:'', groupName:entry.groupName,
-      text:`[Grupo: ${entry.groupName || ''}]\nConteúdo lido do anexo: ${summary}`});
-  }
+  const messageText = `[Grupo: ${entry.groupName || ''}]\nConteúdo lido do anexo: ${summary}`;
+  const existingMessage = session.messages.find(message => message.id === entry.messageId);
+  if (existingMessage) existingMessage.text = messageText;
+  else session.messages.push({group:entry.groupJid, id:entry.messageId, timestamp,
+    sender:'', groupName:entry.groupName, text:messageText});
   const outcome = await gemini.finish(session, 'recuperação de anexo');
   const expected = (summary.match(/^Equipamento:/gm) || []).length;
   if (!outcome || outcome.written < expected || outcome.pending) {

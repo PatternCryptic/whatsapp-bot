@@ -86,7 +86,7 @@ test('envia anexo ao Gemini junto do nome do grupo, legenda e esquema da planilh
     assert.match(summary, /DG2/);
     assert.match(summary, /Axial Horizontal: 0,02 mm/);
     assert.doesNotMatch(summary, /Folga do virabrequim/);
-    assert.match(summary, /Documento: relatorio.pdf/);
+    assert.match(summary, /Document: relatorio.pdf/);
     assert.equal(payload.contents[0].parts[1].inline_data.mime_type, 'application/pdf');
     assert.match(payload.contents[0].parts[0].text, /BRAM Atlas/);
     assert.match(payload.contents[0].parts[0].text, /Axial Horizontal/);
@@ -131,6 +131,21 @@ test('recupera GAP final de quatro geradores sem aceitar folga do virabrequim', 
     assert.doesNotMatch(text, /0,24 mm/);
     assert.match(text, /Diesel Generator #4[\s\S]*Coupling GAP: 27,87 mm/);
   } finally { global.fetch = original; }
+});
+
+test('aceita medida em string somente na seção correta do equipamento', () => {
+  const text = 'Conteúdo lido do anexo: Equipamento: Diesel Generator #1\nCoupling GAP: 27,65 mm (fonte: Figura 49)\nDocument: report.pdf\n\n--- OUTRO EQUIPAMENTO ---\n\nEquipamento: Diesel Generator #2\nCoupling GAP: 29,45 mm (fonte: Figura 27)\nDocument: report.pdf';
+  const item = value => ({value,message:1,quote:`Equipamento: ${value}`});
+  const records = [
+    {status:'incomplete',equipment:item('Diesel Generator #1'),fields:{coupling_gap:'27,65 mm',document:'report.pdf'}},
+    {status:'incomplete',equipment:item('Diesel Generator #2'),fields:{coupling_gap:'29,45 mm',document:'report.pdf'}},
+    {status:'incomplete',equipment:item('Diesel Generator #1'),fields:{coupling_gap:'29,45 mm'}}
+  ];
+  const verified = verifyExtractions({records},[{text}]);
+  assert.equal(verified[0].fields['Coupling gap'],'27,65 mm');
+  assert.equal(verified[1].fields['Coupling gap'],'29,45 mm');
+  assert.equal(verified[0].fields.Document,'report.pdf');
+  assert.equal(verified[2].fields['Coupling gap'],undefined);
 });
 
 
