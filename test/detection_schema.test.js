@@ -47,6 +47,26 @@ test('compara a extração final com os cabeçalhos reais da planilha', async ()
   } finally { global.fetch = original; }
 });
 
+test('prioriza o relatório sobre mensagens antigas de teste na extração final', async () => {
+  const original = global.fetch;
+  let prompt, transcript;
+  global.fetch = async (_url, options) => {
+    prompt = JSON.parse(options.body).contents[0].parts[0].text;
+    return {ok:true,json:async () => ({candidates:[{content:{parts:[{text:'{"records":[]}'}]}}]})};
+  };
+  try {
+    const gemini = makeGeminiFunctions({apiKey:'test',config:{},getRecordSchema:async()=>[],
+      onExtract:async (_session,_reason,_result,messages) => { transcript = messages; }});
+    await gemini.finish({messages:[
+      {text:'bora',timestamp:'2026-11-14T17:00:00Z'},
+      {text:'Conteúdo lido do anexo: Equipamento: DG #1; Coupling GAP: 27,65 mm',timestamp:'2026-11-14T23:29:00Z'}
+    ]},'sincronização periódica');
+    assert.equal(transcript.length, 1);
+    assert.doesNotMatch(prompt, /bora/);
+    assert.match(prompt, /27,65 mm/);
+  } finally { global.fetch = original; }
+});
+
 test('envia anexo ao Gemini junto do nome do grupo, legenda e esquema da planilha', async () => {
   const original = global.fetch;
   let payload;
