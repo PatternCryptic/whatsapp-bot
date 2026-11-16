@@ -269,7 +269,7 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
           const reading = await geminiJson(apiKey, [
             'Leia SOMENTE a imagem anexada, sem receber a legenda textual. Se houver tela PRUFTECHNIK com quadro de resultados finais no canto inferior direito, transcreva literalmente os dois números V e os dois números H.',
             'V superior = Axial Vertical, V inferior = Radial Vertical; H superior = Axial Horizontal, H inferior = Radial Horizontal. Ignore a pequena tabela de amostras acima e números de pé manco.',
-            'Retorne JSON {"compatible":true,"unit":"mm","values":{"Axial Vertical":"-0.01","Radial Vertical":"-0.35","Axial Horizontal":"-0.02","Radial Horizontal":"-0.02"}}. unit deve ser a unidade visível na tela. Se não houver tela legível, retorne compatible false e values vazio.'
+            'Retorne JSON {"compatible":true,"unit":"mm","values":{"Axial Vertical":"0.12","Radial Vertical":"-0.07","Axial Horizontal":"0.04","Radial Horizontal":"-0.03"}}. unit deve ser a unidade visível na tela. Se não houver tela legível, retorne compatible false e values vazio.'
           ].join('\n'), model, [{ mimeType, data }]);
           const visual = Array.isArray(reading) && reading.length === 1 ? reading[0] : reading;
           const number = value => {
