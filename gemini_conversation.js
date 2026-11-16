@@ -228,22 +228,72 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
     return result?.alignment === true;
   }
   async function inspectAttachment({ caption, groupName, fileName, mimeType, data }) {
+    if (/\b(?:procedimento|instru[cç][aã]o|manual)\b/i.test(fileName || '') &&
+        /alinhamento|alignment/i.test(fileName || '') && !caption?.trim()) return 'Documento de referência sobre procedimento de alinhamento; nenhuma atividade ou medição reportada.';
     const schema = await getRecordSchema();
     const result = await geminiJson(apiKey, [
       'Leia o documento inteiro. Primeiro identifique cada equipamento distinto que teve alinhamento. Um relatório com quatro geradores exige quatro registros separados, mesmo quando faltam medições.',
       'Retorne JSON {"records":[{"vessel":"nome literal ou null","equipment":"tag literal","facts":[{"field":"título da coluna","value":"valor literal","evidence":"trecho literal ou identificação da figura e página"}]}]}. Se não houver atividade de alinhamento, retorne records vazio.',
       'Para cada equipamento, compare com os cabeçalhos e use exatamente o título da coluna em field. Extraia GAP final, data e resultados finais quando legíveis; se um campo não estiver claro, omita esse fato. Preserve unidades, números e sinais.',
       'Não confunda folga de virabrequim com Coupling GAP. Não confunda medições antes/depois, tolerâncias e resultados. Não atribua executor pelo autor do documento. Não misture números de equipamentos diferentes.',
+      'Referência do procedimento de coleta: na tela PRUFTECHNIK compatível, leia somente o quadro final inferior direito. V superior = axial vertical; V inferior = radial vertical; H superior = axial horizontal; H inferior = radial horizontal. A tabela pequena acima contém amostras e não é resultado final.',
+      'Associe cada foto ao equipamento e bordo pelo título imediatamente abaixo dela: port/portside = bombordo; stbd/starboard = boreste. Texto que diga apenas que port e starboard foram checados não fornece números de ambos. Método laser só se explicitamente indicado para aquele equipamento.',
+      'A data de emissão da docagem não é a data da medição. Não use data exibida em foto se não for inequívoco que corresponde ao resultado final daquele equipamento. Um procedimento explicativo é referência, não uma atividade de alinhamento.',
       'Se resultados estiverem em fotos de tela, leia-os quando inequívocos e identifique figura/página; caso contrário, omita-os. A falta de alguns campos nunca elimina os demais registros.',
       'NOME DO GRUPO: ' + JSON.stringify(groupName || ''),
       'ARQUIVO: ' + JSON.stringify(fileName || ''),
       'LEGENDA: ' + JSON.stringify(caption || ''),
       'CABEÇALHOS DA PLANILHA: ' + JSON.stringify(schema)
     ].join('\n'), model, [{ mimeType, data }]);
-    const records = Array.isArray(result) ? result : result?.records;
+    const records = Array.isArray(result) && result.length === 1 && Array.isArray(result[0]?.records)
+      ? result[0].records : Array.isArray(result) ? result : result?.records;
     if (!Array.isArray(records)) return typeof result?.summary === 'string' ? result.summary.trim() : '';
     const fold = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
     const validTitles = new Map(schema.filter(col => col.mappedAs?.length).map(col => [fold(col.title), col.title]));
+    // A legenda da pessoa e a tela são fontes independentes. Em caso de divergência,
+    // preserve o registro parcial e sinalize o campo em vez de gravar um número incerto.
+    if (/^image\//i.test(mimeType) && caption) {
+      const names = { 'axial vertical':'Axial Vertical', 'radial vertical':'Radial Vertical',
+        'axial horizontal':'Axial Horizontal', 'radial horizontal':'Radial Horizontal' };
+      const labeled = new Map();
+      for (const match of caption.matchAll(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*([+-]?\d+(?:[.,]\d+)?)/gi)) {
+        labeled.set(names[fold(match[1] + ' ' + match[2])], match[3]);
+      }
+      if (labeled.size) {
+        const pictureFields = new Set(Object.keys(names).map(fold));
+        for (const record of records) {
+          record.facts = (Array.isArray(record.facts) ? record.facts : [])
+            .filter(fact => !pictureFields.has(fold(fact.field)));
+        }
+        try {
+          const reading = await geminiJson(apiKey, [
+            'Leia SOMENTE a imagem anexada, sem receber a legenda textual. Se houver tela PRUFTECHNIK com quadro de resultados finais no canto inferior direito, transcreva literalmente os dois números V e os dois números H.',
+            'V superior = Axial Vertical, V inferior = Radial Vertical; H superior = Axial Horizontal, H inferior = Radial Horizontal. Ignore a pequena tabela de amostras acima e números de pé manco.',
+            'Retorne JSON {"compatible":true,"unit":"mm","values":{"Axial Vertical":"-0.01","Radial Vertical":"-0.35","Axial Horizontal":"-0.02","Radial Horizontal":"-0.02"}}. unit deve ser a unidade visível na tela. Se não houver tela legível, retorne compatible false e values vazio.'
+          ].join('\n'), model, [{ mimeType, data }]);
+          const visual = Array.isArray(reading) && reading.length === 1 ? reading[0] : reading;
+          const number = value => {
+            if (typeof value !== 'string' && typeof value !== 'number') return null;
+            const match = String(value).trim().match(/^([+-]?\d+(?:[.,]\d+)?)(?:\s*mm)?$/i);
+            return match ? Number(match[1].replace(',', '.')) : null;
+          };
+          if (visual?.compatible === true && visual.unit === 'mm') {
+            for (const [title, value] of labeled) {
+              const seen = number(visual.values?.[title]);
+              if (seen === null || seen !== number(value)) {
+                console.warn('Divergência entre legenda e tela:', title);
+                continue;
+              }
+              if (!validTitles.has(fold(title)) || records.length !== 1) continue;
+              records[0].facts.push({field:validTitles.get(fold(title)), value:`${value} mm`,
+                evidence:`Legenda validada na tela: ${title.toLowerCase()}: ${value} mm`});
+            }
+          }
+        } catch (error) {
+          console.warn('Validação da imagem indisponível:', error.message);
+        }
+      }
+    }
     if (mimeType === 'application/pdf' && records.length && validTitles.has('data')) {
       try {
         const result = await geminiJson(apiKey, [
