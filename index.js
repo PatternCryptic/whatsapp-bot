@@ -250,7 +250,12 @@ async function handleMessage(sock, msg) {
     const confirmation = contextInfo?.stanzaId && confirmations.lookup(groupJid, contextInfo.stanzaId);
     if (confirmation) {
       const [key, entry] = confirmation;
-      const corrections = parseCorrection(text);
+      let corrections = parseCorrection(text);
+      const numericReply = text.trim().match(/^([+-]?\d+(?:[.,]\d+)?)\s*(?:mm)?[.!]?$/i);
+      if (!corrections.length && numericReply && entry.conflicts.length === 1) {
+        const key = entry.conflicts[0].field.toLowerCase().replace(/\s+/g, '_');
+        if (['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(key)) corrections = [{key, value:numericReply[1].replace(',', '.') + ' mm'}];
+      }
       if (corrections.length) {
         const required = entry.conflicts.map(c => c.field.toLowerCase().replace(/\s+/g, '_'));
         if (required.some(field => !corrections.some(c => c.key === field))) { appendPending({groupJid, messageId, reason:'resposta não resolveu todas as divergências'}); return; }
