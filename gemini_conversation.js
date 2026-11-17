@@ -405,7 +405,7 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
       n: index + 1,
       time: message.timestamp,
       sender: message.sender,
-      text: message.text
+      text: String(message.text || '').replace(/^DIVERGENCIA_MEDICAO:.*$/gm, '[Medição divergente aguardando confirmação]')
     }));
     const result = await geminiJson(apiKey, [
       'Extraia um registro de alinhamento POR equipamento distinto. Responda JSON {"records":[{"status":"ready|ambiguous|incomplete","vessel":{"value":"texto literal","message":1,"quote":"trecho literal"},"equipment":{"value":"texto literal","message":1,"quote":"trecho literal"},"fields":{"equipment_class":null,"maker":null,"model":null,"stationary_equipment_class":null,"stationary_maker":null,"stationary_model":null,"date":null,"motivation":null,"executor":null,"method":null,"axial_vertical":null,"axial_horizontal":null,"radial_vertical":null,"radial_horizontal":null,"coupling_gap":null,"standard":null,"axial_tolerance":null,"radial_tolerance":null,"coupling_gap_tolerance":null,"document":null,"measurement_unit":null,"axial_vertical_before":null,"axial_horizontal_before":null,"radial_vertical_before":null,"radial_horizontal_before":null}}]}.',
