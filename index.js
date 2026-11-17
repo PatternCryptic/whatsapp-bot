@@ -97,6 +97,9 @@ if (geminiEnabled) {
   const { loadAlignmentConfig } = require('./alignment_config');
   const history = require('./alignment_history');
   const store = fileStore(sessionsFile);
+  // Suppress retroactive notices for sessions present before this process started.
+  const startupSessions = store.load() || {};
+  const baselineCounts = new Map(Object.entries(startupSessions).map(([group, session]) => [group + '|' + session.startedAt, (session.messages || []).length]));
   alignmentConfigPromise = loadAlignmentConfig(sheets, process.env.CONFIG_SPREADSHEET_ID);
   gemini = makeGeminiFunctions({
     apiKey: process.env.GEMINI_API_KEY,
@@ -152,7 +155,7 @@ if (geminiEnabled) {
               ? { message: 'Embarcação ou equipamento não puderam ser associados com segurança; linha registrada com não informado.', result }
               : result, messages: session.messages });
         }
-        if (activeSock && !identityNeedsClarification && ['appended','updated','conflict'].includes(result.status)) {
+        if (activeSock && !identityNeedsClarification && session.messages.length > (baselineCounts.get(session.group + '|' + session.startedAt) || 0) && ['appended','updated','conflict'].includes(result.status)) {
           try {
             const current = await history.findSession(sheets, spreadsheetId, sessionId);
             const shown = {};
