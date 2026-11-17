@@ -98,6 +98,8 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = 
       const note = `Conflito para revisão: ${conflicts.join(', ')}`;
       if (!oldComments.includes(note)) merged[cols.comments] = `${oldComments} | ${note}`.trim();
     }
+    const changed = merged.some((value, i) => String(value || '') !== String(existing[i] || ''));
+    if (!changed) return {status:'unchanged', row:existingIndex + 1};
     const { data: updated } = await sheets.spreadsheets.values.update({
       spreadsheetId,
       range: `'Modelo alinhamento'!A${existingIndex + 1}:${columnLetter(headers.length)}${existingIndex + 1}`,
@@ -113,6 +115,24 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = 
   return { status: 'appended', updatedRange: appended.updates?.updatedRange };
 }
 
+async function findSession(sheets, spreadsheetId, sessionId) {
+  const {data} = await sheets.spreadsheets.values.get({spreadsheetId, range:"'Modelo alinhamento'!A1:ZZ1001"});
+  const rows=data.values || []; const {headers,cols}=mapHeaders(rows);
+  if (cols.comments === undefined) throw new Error('Coluna Comments ausente');
+  const matches=rows.map((row,i)=>({row,i})).filter(x=>x.i>=2 && String(x.row[cols.comments] || '').split(/\s*\|\s*/).includes(`session:${sessionId}`));
+  if(matches.length !== 1) throw new Error('Sessão sem linha única na planilha');
+  return {headers, cols, row:matches[0].row, rowNumber:matches[0].i+1};
+}
+async function correctSession(sheets, spreadsheetId, sessionId, changes) {
+  const found=await findSession(sheets,spreadsheetId,sessionId);
+  for (const change of changes) {
+    const col=found.cols[change.key];
+    if(col === undefined || !['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(change.key)) throw new Error('Campo de medição indisponível');
+  }
+  // Update only the specified cells; avoid overwriting other edits to the row.
+  for(const change of changes) await sheets.spreadsheets.values.update({spreadsheetId,range:`'Modelo alinhamento'!${columnLetter(found.cols[change.key]+1)}${found.rowNumber}`,valueInputOption:'RAW',requestBody:{values:[[change.value]]}});
+}
+
 function columnLetter(number) {
   let value = number;
   let result = '';
@@ -120,6 +140,6 @@ function columnLetter(number) {
   return result;
 }
 
-module.exports = { mapHeaders, makeRow, getRecordSchema, recordHistory, mergeKnownFields };
+module.exports = { mapHeaders, makeRow, getRecordSchema, recordHistory, mergeKnownFields, findSession, correctSession };
 
 
