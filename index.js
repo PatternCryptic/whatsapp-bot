@@ -241,6 +241,20 @@ async function handleMessage(sock, msg) {
           data = await downloadMediaMessage(msg, 'buffer', {}, { logger: P({ level: 'silent' }) });
           if (data.length > 20 * 1024 * 1024) throw new Error('Anexo excede 20 MB');
           const summary = await gemini.inspectAttachment({ caption: text, groupName, fileName, mimeType, data });
+          if (image && /\b(?:axial|radial)\s+(?:vertical|horizontal)\s*:\s*[+-]?\d/i.test(text)) {
+            const originalCaption = text;
+            const labels = [...originalCaption.matchAll(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*([+-]?\d+(?:[.,]\d+)?)/gi)];
+            const safeSummary = String(summary || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+            for (const item of labels) {
+              const field = (item[1] + ' ' + item[2]).toLowerCase();
+              const value = item[3];
+              if (!safeSummary.includes(field + ': ' + value.toLowerCase() + ' mm')) {
+                appendPending({ messageId, groupJid, groupName, reason: 'medição da legenda sem confirmação visual', field, value });
+              }
+            }
+            text = text.replace(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*[+-]?\d+(?:[.,]\d+)?(?:\s*mm)?/gi,
+              '$1 $2: verificação visual no resumo do anexo');
+          }
           if (!summary) {
             const savedAs = archiveFailedAttachment(groupJid, messageId, mimeType, data);
             appendPending({ messageId, groupJid, groupName, fileName, mimeType, savedAs,
