@@ -178,3 +178,14 @@ test('guarda divergência entre legenda e imagem sem gravar valor incerto', asyn
   assert.match(out,/Radial Vertical: -0.35 mm/); assert.doesNotMatch(out,/Axial Vertical: -0.1 mm/);
  } finally {global.fetch=old;}
 });
+
+test('valores divergentes não são oferecidos como medição confirmada na extração', async () => {
+ const old=global.fetch; let request;
+ global.fetch=async (_url,options)=>{request=JSON.parse(options.body);return {ok:true,json:async()=>({candidates:[{content:{parts:[{text:'{"records":[]}'}]}}]})};};
+ try {
+  const g=makeGeminiFunctions({apiKey:'test',config:{},getRecordSchema:async()=>[],onExtract:async()=>({})});
+  await g.finish({messages:[{text:'Conteúdo lido do anexo: Equipamento: MCP 1\nDIVERGENCIA_MEDICAO: {"field":"Axial Vertical","caption":"-0.1 mm","visual":"-0.01 mm"}'}]},'teste');
+  const prompt=request.contents[0].parts[0].text;
+  assert.doesNotMatch(prompt, /-0\.1 mm/); assert.doesNotMatch(prompt, /-0\.01 mm/); assert.match(prompt,/aguardando confirmação/);
+ } finally {global.fetch=old;}
+});
