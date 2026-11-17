@@ -16,6 +16,7 @@ test('relatório com quatro geradores gera quatro linhas e preserva ausências',
       fileStore: () => ({ load() {}, save() {} }),
       makeGeminiFunctions: args => { onExtract = args.onExtract; return {}; }
     },
+    './confirmations': {createConfirmations: () => ({lookup: () => null}), parseCorrection: () => []},
     './alignment_config': { loadAlignmentConfig: async () => ({}) },
     './alignment_history': { recordHistory: async (_sheets, _id, data, sessionId) => {
       writes.push({ data, sessionId }); return { status:'appended' };
