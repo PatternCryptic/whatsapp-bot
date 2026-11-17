@@ -456,7 +456,19 @@ function verifyExtraction(result, transcript) {
   };
 
   const vessel = verifiedValue(result.vessel) || 'não informado';
-  const equipment = verifiedValue(result.equipment) || 'não informado';
+  const sections = transcript.flatMap(message => {
+    const marker = 'Conteúdo lido do anexo:';
+    const text = String(message.text || '');
+    if (!text.includes(marker)) return [];
+    return text.slice(text.indexOf(marker) + marker.length).split(/--- OUTRO EQUIPAMENTO ---/i);
+  });
+  const names = [...new Set(sections.flatMap(section => {
+    const match = section.match(/^\s*Equipamento:\s*(.+)$/im);
+    return match && match[1].trim() ? [match[1].trim()] : [];
+  }))];
+  const verifiedEquipment = verifiedValue(result.equipment);
+  // Only recover identity when all attachment sections name the same equipment.
+  const equipment = verifiedEquipment || (sections.length === 1 && names.length === 1 ? names[0] : 'não informado');
 
   // Gemini por vezes simplifica um campo para string. Só aceita esse formato
   // quando a mesma medida aparece com o cabeçalho na seção do equipamento.
@@ -477,6 +489,18 @@ function verifyExtraction(result, transcript) {
   for (const [key, label] of Object.entries(FIELD_LABELS)) {
     const value = verifiedValue(result.fields?.[key]) || verifiedString(result.fields?.[key], label);
     if (value) fields[label] = value;
+  }
+  if (equipment !== 'não informado' && sections.length === 1 && names.length === 1 && fold(names[0]) === fold(equipment)) {
+    for (const [key, label] of Object.entries(FIELD_LABELS)) {
+      if (fields[label]) continue;
+      const candidates = sections.flatMap(section => section.split('\n').flatMap(line => {
+        const match = line.match(/^([^:]+):\s*(.*?)\s+\(fonte:\s*(.+)\)$/i);
+        if (!match || fold(match[1].trim()) !== fold(label) || !match[2].trim()) return [];
+        return fold(match[3]).includes(fold(match[2])) ? [match[2].trim()] : [];
+      }));
+      const unique = [...new Set(candidates)];
+      if (unique.length === 1) fields[label] = unique[0];
+    }
   }
   const input = [`Vessel: ${vessel}`, `Equipment: ${equipment}`];
   for (const [label, value] of Object.entries(fields)) input.push(`${label}: ${value}`);
