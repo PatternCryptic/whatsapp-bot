@@ -256,6 +256,7 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
       const names = { 'axial vertical':'Axial Vertical', 'radial vertical':'Radial Vertical',
         'axial horizontal':'Axial Horizontal', 'radial horizontal':'Radial Horizontal' };
       const labeled = new Map();
+      const disagreements = [];
       for (const match of caption.matchAll(/\b(axial|radial)\s+(vertical|horizontal)\s*:\s*([+-]?\d+(?:[.,]\d+)?)/gi)) {
         labeled.set(names[fold(match[1] + ' ' + match[2])], match[3]);
       }
@@ -282,17 +283,22 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
               const seen = number(visual.values?.[title]);
               if (seen === null || seen !== number(value)) {
                 console.warn('Divergência entre legenda e tela:', title);
+                disagreements.push({field:title, caption:value + ' mm', visual:seen === null ? null : String(seen) + ' mm'});
                 continue;
               }
               if (!validTitles.has(fold(title)) || records.length !== 1) continue;
               records[0].facts.push({field:validTitles.get(fold(title)), value:`${value} mm`,
                 evidence:`Legenda validada na tela: ${title.toLowerCase()}: ${value} mm`});
             }
+          } else {
+            for (const [title,value] of labeled) disagreements.push({field:title, caption:value + ' mm', visual:null});
           }
         } catch (error) {
+          for (const [title,value] of labeled) disagreements.push({field:title, caption:value + ' mm', visual:null});
           console.warn('Validação da imagem indisponível:', error.message);
         }
       }
+      if (records.length === 1 && disagreements.length) records[0].disagreements = disagreements;
     }
     if (mimeType === 'application/pdf' && records.length && validTitles.has('data')) {
       try {
@@ -363,7 +369,8 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
           `Equipamento: ${record.equipment.trim()}`,
           record.vessel ? `Embarcação: ${record.vessel}` : '',
           fileName ? `Document: ${fileName}` : '',
-          ...facts
+          ...facts,
+          ...(record.disagreements || []).map(d => `DIVERGENCIA_MEDICAO: ${JSON.stringify(d)}`)
         ].filter(Boolean);
         return lines.join('\n');
       }).join('\n\n--- OUTRO EQUIPAMENTO ---\n\n');
