@@ -76,3 +76,15 @@ test('mapeia títulos por nomes e distingue colunas repetidas pelo grupo', () =>
 });
 
 
+
+test('correção atualiza somente a linha identificada pela sessão e recusa duplicidade', async () => {
+  const {correctSession}=require('../alignment_history');
+  let writes=[]; let rows=[['Drive Machine',null,'Historico de alinhamento',null,'Reference'],['Vessel','Equipment / Tag','Axial Vertical','Axial Horizontal','Comments'],['Joe','MCP 1','não informado','-0.02 mm','session:a'],['Joe','MCP 2','0.3 mm','0.1 mm','session:b']];
+  const sheets={spreadsheets:{values:{get:async()=>({data:{values:rows}}),update:async input=>{writes.push(input);return {data:{}};}}}};
+  await correctSession(sheets,'id','a',[{key:'axial_vertical',value:'-0.01 mm'}]);
+  assert.equal(writes.length,1); assert.equal(writes[0].range,"'Modelo alinhamento'!C3");
+  assert.equal(writes[0].requestBody.values[0][0],'-0.01 mm');
+  rows.push(['Joe','MCP 3','','','session:a']);
+  await assert.rejects(correctSession(sheets,'id','a',[{key:'axial_vertical',value:'1 mm'}]));
+  assert.equal(writes.length,1);
+});

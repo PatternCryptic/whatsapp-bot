@@ -166,3 +166,26 @@ test('registra período geral do serviço sem criar uma data para cada DG', asyn
 });
 
 
+
+test('guarda divergência entre legenda e imagem sem gravar valor incerto', async () => {
+ const old=global.fetch; let n=0;
+ global.fetch=async()=>({ok:true,json:async()=>({candidates:[{content:{parts:[{text:JSON.stringify(++n===1 ? {records:[{vessel:'Joe Griffin',equipment:'MCP 1',facts:[]}]} : {compatible:true,unit:'mm',values:{'Axial Vertical':'-0.01','Radial Vertical':'-0.35','Axial Horizontal':'-0.02','Radial Horizontal':'-0.02'}})}]}}]})});
+ try {
+  const schema=['Axial Vertical','Radial Vertical','Axial Horizontal','Radial Horizontal'].map(title=>({title,mappedAs:['x']}));
+  const g=makeGeminiFunctions({apiKey:'test',config:{},getRecordSchema:async()=>schema});
+  const out=await g.inspectAttachment({caption:'axial vertical: -0.1\nradial vertical: -0.35\naxial horizontal: -0.02\nradial horizontal: -0.02',groupName:'Joe Griffin',fileName:'',mimeType:'image/jpeg',data:Buffer.from('test')});
+  assert.match(out,/DIVERGENCIA_MEDICAO:.*-0.1 mm.*-0.01 mm/);
+  assert.match(out,/Radial Vertical: -0.35 mm/); assert.doesNotMatch(out,/Axial Vertical: -0.1 mm/);
+ } finally {global.fetch=old;}
+});
+
+test('valores divergentes não são oferecidos como medição confirmada na extração', async () => {
+ const old=global.fetch; let request;
+ global.fetch=async (_url,options)=>{request=JSON.parse(options.body);return {ok:true,json:async()=>({candidates:[{content:{parts:[{text:'{"records":[]}'}]}}]})};};
+ try {
+  const g=makeGeminiFunctions({apiKey:'test',config:{},getRecordSchema:async()=>[],onExtract:async()=>({})});
+  await g.finish({messages:[{text:'Conteúdo lido do anexo: Equipamento: MCP 1\nDIVERGENCIA_MEDICAO: {"field":"Axial Vertical","caption":"-0.1 mm","visual":"-0.01 mm"}'}]},'teste');
+  const prompt=request.contents[0].parts[0].text;
+  assert.doesNotMatch(prompt, /-0\.1 mm/); assert.doesNotMatch(prompt, /-0\.01 mm/); assert.match(prompt,/aguardando confirmação/);
+ } finally {global.fetch=old;}
+});

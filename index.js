@@ -90,11 +90,16 @@ let gemini = null;
 let activeSock = null;
 let alignmentConfigPromise = null;
 const groupTitleCache = new Map();
+const {createConfirmations, parseCorrection} = require('./confirmations');
+const confirmations = createConfirmations(path.join(__dirname, 'alignment-confirmations.json'));
 if (geminiEnabled) {
   const { createTracker, fileStore, makeGeminiFunctions, verifyExtractions } = require('./gemini_conversation');
   const { loadAlignmentConfig } = require('./alignment_config');
   const history = require('./alignment_history');
   const store = fileStore(sessionsFile);
+  // Suppress retroactive notices for sessions present before this process started.
+  const startupSessions = store.load() || {};
+  const baselineCounts = new Map(Object.entries(startupSessions).map(([group, session]) => [group + '|' + session.startedAt, (session.messages || []).length]));
   alignmentConfigPromise = loadAlignmentConfig(sheets, process.env.CONFIG_SPREADSHEET_ID);
   gemini = makeGeminiFunctions({
     apiKey: process.env.GEMINI_API_KEY,
@@ -141,14 +146,37 @@ if (geminiEnabled) {
           observations: Object.entries(fields).filter(([key]) => /antes do ajuste|unidade das medições/i.test(key))
             .map(([key, value]) => `${key}: ${value}`).join('; ')
         }, sessionId);
-        if (['appended', 'updated', 'duplicate', 'conflict'].includes(result.status)) written += 1;
+        if (['appended', 'updated', 'duplicate', 'conflict', 'unchanged'].includes(result.status)) written += 1;
         const identityNeedsClarification = checked.vessel === 'não informado' || checked.equipment === 'não informado';
-        if (!['appended', 'updated', 'duplicate'].includes(result.status) || identityNeedsClarification) {
+        if (!['appended', 'updated', 'duplicate', 'unchanged'].includes(result.status) || identityNeedsClarification) {
           appendPending({ groupJid: session.group, startedAt: session.startedAt,
             closedAt: new Date().toISOString(), equipment: checked.equipment,
             reason: identityNeedsClarification
               ? { message: 'Embarcação ou equipamento não puderam ser associados com segurança; linha registrada com não informado.', result }
               : result, messages: session.messages });
+        }
+        if (activeSock && !identityNeedsClarification && session.messages.length > (baselineCounts.get(session.group + '|' + session.startedAt) || 0) && ['appended','updated','conflict'].includes(result.status)) {
+          try {
+            const current = await history.findSession(sheets, spreadsheetId, sessionId);
+            const shown = {};
+            for (const [key,col] of Object.entries(current.cols)) {
+              if (key === 'comments' || key.startsWith('stationary_')) continue;
+              const value = current.row[col];
+              if (value && String(value).toLowerCase() !== 'não informado') shown[current.headers[col]] = String(value);
+            }
+            const conflicts = [];
+            if (checkedRecords.length === 1) for (const msg of session.messages) {
+              for (const line of String(msg.text || '').split('\n')) if (line.startsWith('DIVERGENCIA_MEDICAO: ')) {
+                try { conflicts.push(JSON.parse(line.slice('DIVERGENCIA_MEDICAO: '.length))); } catch {}
+              }
+            }
+            const prompt = confirmations.prepare(session.group, sessionId, checked.vessel, checked.equipment, shown, conflicts);
+            if (prompt) {
+              const sent = await activeSock.sendMessage(session.group, {text:prompt.text});
+              if (!sent?.key?.id) throw new Error('Mensagem sem identificador');
+              confirmations.sent(prompt.key, sent.key.id);
+            }
+          } catch (error) { appendPending({groupJid:session.group, sessionId, reason:'confirmação não enviada ou pendente de revisão: '+error.message}); }
         }
         console.log('Registro de alinhamento:', checked.equipment, result.status);
       }
@@ -221,6 +249,32 @@ async function handleMessage(sock, msg) {
   }
 
   if (geminiEnabled) {
+    const contextInfo = content.extendedTextMessage?.contextInfo || content.imageMessage?.contextInfo || content.documentMessage?.contextInfo;
+    const confirmation = contextInfo?.stanzaId && confirmations.lookup(groupJid, contextInfo.stanzaId);
+    if (confirmation) {
+      const [key, entry] = confirmation;
+      let corrections = parseCorrection(text);
+      const numericReply = text.trim().match(/^([+-]?\d+(?:[.,]\d+)?)\s*(?:mm)?[.!]?$/i);
+      if (!corrections.length && numericReply && entry.conflicts.length === 1) {
+        const key = entry.conflicts[0].field.toLowerCase().replace(/\s+/g, '_');
+        if (['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(key)) corrections = [{key, value:numericReply[1].replace(',', '.') + ' mm'}];
+      }
+      if (corrections.length) {
+        const required = entry.conflicts.map(c => c.field.toLowerCase().replace(/\s+/g, '_'));
+        if (required.some(field => !corrections.some(c => c.key === field))) { appendPending({groupJid, messageId, reason:'resposta não resolveu todas as divergências'}); return; }
+        if (new Set(corrections.map(x=>x.key)).size !== corrections.length) {
+          appendPending({groupJid, messageId, reason:'resposta com medições duplicadas'}); return;
+        }
+        await require('./alignment_history').correctSession(sheets, spreadsheetId, entry.sessionId, corrections);
+        confirmations.done(key, messageId);
+        if (messageId) { seenIds.add(messageId); saveSeenIds(); }
+      } else if (/^(?:sim|correto|corretos|confirmo|confirmado|ok|certo)[.!\s]*$/i.test(text)) {
+        if (entry.conflicts.length) { appendPending({groupJid, messageId, reason:'confirmação genérica com divergência pendente'}); return; }
+        confirmations.done(key, messageId);
+        if (messageId) { seenIds.add(messageId); saveSeenIds(); }
+      } else appendPending({groupJid, messageId, reason:'resposta de confirmação não reconhecida'});
+      return;
+    }
     let groupName = groupTitleCache.get(groupJid)?.name || '';
     if (!groupName || Date.now() - groupTitleCache.get(groupJid).time > 60 * 60 * 1000) {
       try {

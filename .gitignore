@@ -58,3 +58,6 @@ Thumbs.db
 pending-alignment.jsonl
 failed-attachments/
 index.js.before-*
+
+# Confirmações contêm dados de conversas
+alignment-confirmations.json

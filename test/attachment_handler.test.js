@@ -16,6 +16,7 @@ test('recebe PDF no grupo e entrega o conteúdo ao rastreador', async () => {
       createTracker: () => ({ process: async msg => { tracked = msg; return 'aberta'; } }),
       fileStore: () => ({ load() {}, save() {} }), makeGeminiFunctions: () => gemini
     },
+    './confirmations': {createConfirmations: () => ({lookup: () => null}), parseCorrection: () => []},
     './alignment_config': { loadAlignmentConfig: async () => ({}) },
     './alignment_history': {}
   };
