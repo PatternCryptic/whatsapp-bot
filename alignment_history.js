@@ -54,7 +54,10 @@ function makeRow(width, cols, data, sessionId) {
   const row = Array(width).fill('não informado');
   const set = (key, value) => { if (cols[key] !== undefined) row[cols[key]] = value == null || String(value).trim() === '' ? 'não informado' : String(value); };
   for (const key of Object.keys(cols)) if (key !== 'comments') set(key, data[key]);
-  set('comments', [data.observations, `session:${sessionId}`].filter(Boolean).join(' | ') || `session:${sessionId}`);
+  const metadata = [`session:${sessionId}`];
+  if (data.groupJid) metadata.push(`group:${data.groupJid}`);
+  metadata.push(`recorded_at:${data.recordedAt || new Date().toISOString()}`);
+  set('comments', [data.observations, ...metadata].filter(Boolean).join(' | '));
   return row;
 }
 
@@ -70,8 +73,8 @@ async function getRecordSchema(sheets, spreadsheetId) {
   }).filter(column => column.title);
 }
 
-async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = false } = {}) {
-  const range = "'Modelo alinhamento'!A1:ZZ1001";
+async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = false, overwriteFields = [] } = {}) {
+  const range = "'Modelo alinhamento'!A1:ZZ";
   const { data: result } = await sheets.spreadsheets.values.get({ spreadsheetId, range });
   const values = result.values || [];
   const { headers, cols } = mapHeaders(values);
@@ -79,7 +82,30 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = 
     throw new Error('Cabeçalhos necessários ausentes ou ambíguos; nenhuma linha foi gravada');
   }
   if (dryRun) return { status: 'validated', columns: Object.keys(cols) };
-  const existingIndex = values.findIndex((row, index) => index >= 2 && String(row[cols.comments] || '').includes(`session:${sessionId}`));
+  let existingIndex = values.findIndex((row, index) => index >= 2 &&
+    String(row[cols.comments] || '').split(/\s*\|\s*/).includes(`session:${sessionId}`));
+  let deduplicatedByIdentity = false;
+  if (existingIndex < 0 && cols.vessel !== undefined && cols.equipment !== undefined) {
+    const normalizeEquipment = value => normalize(value)
+      .replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
+      .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
+    const timestamp = new Date(data.recordedAt || Date.now()).getTime();
+    const vessel = normalize(data.vessel);
+    const equipment = normalizeEquipment(data.equipment);
+    const matches = values.map((row, index) => {
+      if (index < 2 || normalize(row[cols.vessel]) !== vessel || normalizeEquipment(row[cols.equipment]) !== equipment) return null;
+      const comments = String(row[cols.comments] || '');
+      const recorded = comments.match(/(?:^|\s\|\s*)recorded_at:(\S+)/i)?.[1];
+      const recordedAt = recorded ? new Date(recorded).getTime() : NaN;
+      return Number.isFinite(recordedAt) && timestamp >= recordedAt && timestamp - recordedAt < 2 * 60 * 60 * 1000
+        ? index : null;
+    }).filter(index => index !== null);
+    if (matches.length > 1) return {status:'ambiguous_duplicate', rows:matches.map(index => index + 1)};
+    if (matches.length === 1) {
+      existingIndex = matches[0];
+      deduplicatedByIdentity = true;
+    }
+  }
   const row = makeRow(headers.length, cols, data, sessionId);
   if (existingIndex >= 2) {
     const existing = values[existingIndex] || [];
@@ -90,11 +116,24 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = 
       if (key === 'comments') continue;
       const oldValue = String(existing[col] || '').trim();
       const newValue = String(row[col] || '').trim();
+      if (deduplicatedByIdentity && ['vessel','equipment'].includes(key)) continue;
+      if (overwriteFields.includes(key) && newValue && normalize(newValue) !== 'nao informado') {
+        merged[col] = newValue;
+        continue;
+      }
       if (!oldValue || normalize(oldValue) === 'nao informado') merged[col] = newValue || 'não informado';
       else if (newValue && normalize(newValue) !== 'nao informado' && normalize(oldValue) !== normalize(newValue)) conflicts.push(headers[col]);
     }
-    if (conflicts.length) {
+    {
       const oldComments = String(existing[cols.comments] || '');
+      const metadata = oldComments.split(/\s*\|\s*/).filter(part => !/^recorded_at:/i.test(part));
+      if (!metadata.includes(`session:${sessionId}`)) metadata.push(`session:${sessionId}`);
+      if (data.groupJid && !metadata.includes(`group:${data.groupJid}`)) metadata.push(`group:${data.groupJid}`);
+      metadata.push(`recorded_at:${data.recordedAt || new Date().toISOString()}`);
+      merged[cols.comments] = metadata.filter(Boolean).join(' | ');
+    }
+    if (conflicts.length) {
+      const oldComments = String(merged[cols.comments] || '');
       const note = `Conflito para revisão: ${conflicts.join(', ')}`;
       if (!oldComments.includes(note)) merged[cols.comments] = `${oldComments} | ${note}`.trim();
     }
@@ -106,13 +145,14 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = 
       valueInputOption: 'RAW', requestBody: { values: [merged] }
     });
     if (conflicts.length) return { status: 'conflict', row: existingIndex + 1, fields: conflicts, updatedRange: updated.updatedRange };
-    return { status: 'updated', updatedRange: updated.updatedRange };
+    return { status: deduplicatedByIdentity ? 'deduplicated' : 'updated', row:existingIndex + 1, updatedRange: updated.updatedRange };
   }
-  const { data: appended } = await sheets.spreadsheets.values.append({
-    spreadsheetId, range: "'Modelo alinhamento'!A:ZZ", valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
+  const nextRow = Math.max(3, values.length + 1);
+  const { data: appended } = await sheets.spreadsheets.values.update({
+    spreadsheetId, range: `'Modelo alinhamento'!A${nextRow}:${columnLetter(headers.length)}${nextRow}`, valueInputOption: 'RAW',
     requestBody: { values: [row] }
   });
-  return { status: 'appended', updatedRange: appended.updates?.updatedRange };
+  return { status: 'appended', updatedRange: appended.updatedRange };
 }
 
 async function findSession(sheets, spreadsheetId, sessionId) {

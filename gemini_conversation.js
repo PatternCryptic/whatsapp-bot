@@ -74,6 +74,7 @@ function createTracker({
       group: msg.group,
       startedAt: msg.timestamp || new Date(t).toISOString(),
       lastRelated: t,
+      activatedByMention: msg.activatedByMention === true,
       messages: [msg]
     };
   }
@@ -99,6 +100,7 @@ function createTracker({
       }
 
       if (msg.id && session.messages.some((item) => item.id === msg.id)) return 'duplicada';
+      if (msg.activatedByMention === true) session.activatedByMention = true;
       if (session.messages.length >= maxMessages) {
         await close(msg.group, 'limite de mensagens');
         if (await detect(msg)) {
@@ -132,6 +134,11 @@ function createTracker({
         const synced = await onTick(session);
         if (synced !== false) session.lastAnalyzedMessageCount = session.messages.length;
       }
+      await persist();
+    }),
+    clearGroup: (group) => enqueue(async () => {
+      delete sessions[group];
+      delete recentContext[group];
       await persist();
     }),
     snapshot: () => JSON.parse(JSON.stringify(sessions))

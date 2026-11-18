@@ -4,9 +4,10 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const extraction = require('../gemini_conversation');
 
-test('relatório com quatro geradores gera quatro linhas e preserva ausências', async () => {
+test('relatório com quatro geradores gera propostas sem gravar antes da validação', async () => {
   let onExtract;
   const writes = [];
+  const proposals = [];
   const mocks = {
     '@whiskeysockets/baileys': {}, 'qrcode-terminal': {}, pino: () => ({}),
     googleapis: { google: { options() {}, auth: { GoogleAuth: class {} }, sheets: () => ({}) } },
@@ -16,11 +17,21 @@ test('relatório com quatro geradores gera quatro linhas e preserva ausências',
       fileStore: () => ({ load() {}, save() {} }),
       makeGeminiFunctions: args => { onExtract = args.onExtract; return {}; }
     },
-    './confirmations': {createConfirmations: () => ({lookup: () => null}), parseCorrection: () => []},
+    './confirmations': {createConfirmations: () => ({lookup: () => null, prepare: (group,sessionId,proposal) => {
+      proposals.push({group,sessionId,proposal}); return {key:String(proposals.length),text:proposal.text};
+    }}), parseCorrection: () => [], isApproval: () => false},
     './alignment_config': { loadAlignmentConfig: async () => ({}) },
-    './alignment_history': { recordHistory: async (_sheets, _id, data, sessionId) => {
-      writes.push({ data, sessionId }); return { status:'appended' };
-    } }
+    './alignment_history': {
+      getRecordSchema: async () => [
+        {title:'Vessel',group:'',mappedAs:['vessel']},
+        {title:'Equipment / Tag',group:'',mappedAs:['equipment']},
+        {title:'Data',group:'History',mappedAs:['date']},
+        {title:'Maker',group:'Drive Machine',mappedAs:['maker']},
+        {title:'Maker',group:'Máquina Estacionária',mappedAs:['stationary_maker']},
+        {title:'Axial Vertical',group:'History',mappedAs:['axial_vertical']}
+      ],
+      recordHistory: async (_sheets, _id, data, sessionId) => { writes.push({data,sessionId}); return {status:'appended'}; }
+    }
   };
   const source = fs.readFileSync(require.resolve('../index.js'), 'utf8');
   const start = source.indexOf("process.on('SIGINT'");
@@ -37,15 +48,18 @@ test('relatório com quatro geradores gera quatro linhas e preserva ausências',
   const session = {group:'group@g.us', startedAt:'2026-11-14T23:29:36Z', messages:[{text}]};
   const outcome = await onExtract(session, 'sincronização periódica', {records}, [{text}]);
 
-  assert.equal(outcome.written, 4);
+  assert.equal(outcome.proposed, 4);
   assert.equal(outcome.pending, 0);
-  assert.equal(writes.length, 4);
-  assert.equal(new Set(writes.map(row => row.sessionId)).size, 4);
-  assert.deepEqual(writes.map(row => row.data.equipment),
+  assert.equal(writes.length, 0);
+  assert.equal(proposals.length, 4);
+  assert.equal(new Set(proposals.map(row => row.sessionId)).size, 4);
+  assert.deepEqual(proposals.map(row => row.proposal.data.equipment),
     ['Diesel Generator #1', 'Diesel Generator #2', 'Diesel Generator #3', 'Diesel Generator #4']);
-  assert.equal(writes[2].data.coupling_gap, '31,00 mm');
-  assert.equal(writes[0].data.coupling_gap, undefined);
+  assert.equal(proposals[2].proposal.data.coupling_gap, '31,00 mm');
+  assert.match(proposals[0].proposal.text,/Axial Vertical: não informado/);
+  assert.match(proposals[0].proposal.text,/Maker \(Drive Machine\): não informado/);
+  assert.match(proposals[0].proposal.text,/Maker \(Máquina Estacionária\): não informado/);
 
   await onExtract(session, 'sincronização periódica', {records}, [{text}]);
-  assert.deepEqual(writes.slice(4).map(row => row.sessionId), writes.slice(0,4).map(row => row.sessionId));
+  assert.equal(writes.length,0);
 });
