@@ -3,6 +3,31 @@ const assert = require('node:assert/strict');
 const { createTracker, makeGeminiFunctions, verifyExtractions } = require('../gemini_conversation');
 const { getRecordSchema } = require('../alignment_history');
 
+test('recupera equipamento e campos comprovados de um único anexo', () => {
+  const text = '[Grupo: Exemplo] Embarcação Exemplo\nConteúdo lido do anexo: Equipamento: MCP\nData: 17/11 (fonte: legenda data 17/11)\nRadial Vertical: -0.35 mm (fonte: tela -0.35 mm)\n[Medição divergente aguardando confirmação]';
+  const result = {status:'incomplete', vessel:{value:'Embarcação Exemplo', message:1, quote:'Embarcação Exemplo'}, equipment:null, fields:{}};
+  const [record] = verifyExtractions({records:[result]}, [{text}]);
+  assert.equal(record.equipment, 'MCP');
+  assert.equal(record.fields.Data, '17/11');
+  assert.equal(record.fields['Radial vertical'], '-0.35 mm');
+  assert.equal(record.fields['Axial vertical'], undefined);
+});
+
+test('usa o anexo mais recente quando a extração do Gemini omite a identidade', () => {
+  const transcript = [{text:'Conteúdo lido do anexo: Equipamento: MCP\nRadial Vertical: 0.10 mm (fonte: 0.10 mm)'},
+    {text:'Conteúdo lido do anexo: Equipamento: MCP\nRadial Vertical: 0.20 mm (fonte: 0.20 mm)'}];
+  const [record] = verifyExtractions({records:[{status:'incomplete',fields:{}}]}, transcript);
+  assert.equal(record.equipment, 'MCP');
+  assert.equal(record.fields['Radial vertical'], '0.20 mm');
+});
+
+test('mantém ambígua a última leitura que contém mais de um equipamento', () => {
+  const transcript = [{text:'Conteúdo lido do anexo: Equipamento: MCP 1\nRadial Vertical: 0.10 mm (fonte: 0.10 mm)\n\n--- OUTRO EQUIPAMENTO ---\n\nEquipamento: MCP 2\nRadial Vertical: 0.20 mm (fonte: 0.20 mm)'}];
+  const [record] = verifyExtractions({records:[{status:'incomplete',fields:{}}]}, transcript);
+  assert.equal(record.equipment, 'não informado');
+  assert.deepEqual(record.fields, {});
+});
+
 test('inicia sessão com detecção contextual e ignora conversa sem relação', async () => {
   const tracker = createTracker({ detect: async m => m.text.includes('alinhar o eixo'), classify: async () => 'related',
     finish: async () => {}, save: async () => {} });
