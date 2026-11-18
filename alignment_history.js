@@ -71,7 +71,7 @@ async function getRecordSchema(sheets, spreadsheetId) {
 }
 
 async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = false } = {}) {
-  const range = "'Modelo alinhamento'!A1:ZZ1001";
+  const range = "'Modelo alinhamento'!A1:ZZ";
   const { data: result } = await sheets.spreadsheets.values.get({ spreadsheetId, range });
   const values = result.values || [];
   const { headers, cols } = mapHeaders(values);
@@ -108,11 +108,12 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = 
     if (conflicts.length) return { status: 'conflict', row: existingIndex + 1, fields: conflicts, updatedRange: updated.updatedRange };
     return { status: 'updated', updatedRange: updated.updatedRange };
   }
-  const { data: appended } = await sheets.spreadsheets.values.append({
-    spreadsheetId, range: "'Modelo alinhamento'!A:ZZ", valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
+  const nextRow = Math.max(3, values.length + 1);
+  const { data: appended } = await sheets.spreadsheets.values.update({
+    spreadsheetId, range: `'Modelo alinhamento'!A${nextRow}:${columnLetter(headers.length)}${nextRow}`, valueInputOption: 'RAW',
     requestBody: { values: [row] }
   });
-  return { status: 'appended', updatedRange: appended.updates?.updatedRange };
+  return { status: 'appended', updatedRange: appended.updatedRange };
 }
 
 async function findSession(sheets, spreadsheetId, sessionId) {
