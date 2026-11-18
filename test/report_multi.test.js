@@ -26,6 +26,8 @@ test('relatório com quatro geradores gera propostas sem gravar antes da valida�
         {title:'Vessel',group:'',mappedAs:['vessel']},
         {title:'Equipment / Tag',group:'',mappedAs:['equipment']},
         {title:'Data',group:'History',mappedAs:['date']},
+        {title:'Maker',group:'Drive Machine',mappedAs:['maker']},
+        {title:'Maker',group:'Máquina Estacionária',mappedAs:['stationary_maker']},
         {title:'Axial Vertical',group:'History',mappedAs:['axial_vertical']}
       ],
       recordHistory: async (_sheets, _id, data, sessionId) => { writes.push({data,sessionId}); return {status:'appended'}; }
@@ -55,6 +57,8 @@ test('relatório com quatro geradores gera propostas sem gravar antes da valida�
     ['Diesel Generator #1', 'Diesel Generator #2', 'Diesel Generator #3', 'Diesel Generator #4']);
   assert.equal(proposals[2].proposal.data.coupling_gap, '31,00 mm');
   assert.match(proposals[0].proposal.text,/Axial Vertical: não informado/);
+  assert.match(proposals[0].proposal.text,/Maker \(Drive Machine\): não informado/);
+  assert.match(proposals[0].proposal.text,/Maker \(Máquina Estacionária\): não informado/);
 
   await onExtract(session, 'sincronização periódica', {records}, [{text}]);
   assert.equal(writes.length,0);
