@@ -27,9 +27,9 @@ test('recebe PDF no grupo e entrega o conteúdo ao rastreador', async () => {
     process: { env: { SPREADSHEET_ID: 'test', CONFIG_SPREADSHEET_ID: 'test', GEMINI_API_KEY: 'test', GEMINI_CONVERSATION_ENABLED: 'true' } },
     console, fetch, setInterval: () => ({ unref() {} }), setTimeout, Date };
   vm.runInNewContext(source.slice(0, start) + '\nthis.handle = handleMessage;', context);
-  await context.handle({ groupMetadata: async () => ({ subject: 'BRAM Breeze' }) }, {
+  await context.handle({ user:{id:'12345@s.whatsapp.net'}, groupMetadata: async () => ({ subject: 'BRAM Breeze' }) }, {
     key: { remoteJid: 'grupo@g.us', id: 'test' },
-    message: { documentMessage: { mimetype: 'application/pdf', fileName: 'relatorio.pdf' } }
+    message: { documentMessage: { mimetype: 'application/pdf', fileName: 'relatorio.pdf', contextInfo:{mentionedJid:['12345@s.whatsapp.net']} } }
   });
   assert.equal(inspected.fileName, 'relatorio.pdf');
   assert.equal(inspected.groupName, 'BRAM Breeze');
@@ -42,7 +42,7 @@ test('recebe PDF no grupo e entrega o conteúdo ao rastreador', async () => {
   mocks.fs.chmodSync = () => {};
   mocks.fs.appendFileSync = (_file, line) => { pending = JSON.parse(line); };
   mocks.fs.writeFileSync = (file, data) => { if (file.endsWith('.pdf')) archived = data; };
-  await context.handle({ groupMetadata: async () => ({ subject: 'BRAM Breeze' }) }, {
+  await context.handle({ user:{id:'12345@s.whatsapp.net'}, groupMetadata: async () => ({ subject: 'BRAM Breeze' }) }, {
     key: { remoteJid: 'grupo@g.us', id: 'test2' },
     message: { documentMessage: { mimetype: 'application/pdf', fileName: 'relatorio.pdf', caption: 'Segue relatório final' } }
   });
