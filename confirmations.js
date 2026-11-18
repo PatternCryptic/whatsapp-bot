@@ -1,29 +1,105 @@
 const fs = require('fs');
 const crypto = require('crypto');
-const FIELDS = {'axial vertical':'axial_vertical','axial horizontal':'axial_horizontal','radial vertical':'radial_vertical','radial horizontal':'radial_horizontal'};
+
+const FIELDS = {
+  'vessel':'vessel', 'embarcação':'vessel', 'embarcacao':'vessel', 'navio':'vessel',
+  'equipment':'equipment', 'equipment / tag':'equipment', 'equipment/tag':'equipment',
+  'tag do equipamento':'equipment', 'equipment id':'equipment', 'equipamento':'equipment',
+  'axial vertical':'axial_vertical', 'axial horizontal':'axial_horizontal',
+  'radial vertical':'radial_vertical', 'radial horizontal':'radial_horizontal',
+  'equipment class':'class', 'classe do equipamento':'class',
+  'maker':'maker', 'fabricante':'maker', 'model':'model', 'modelo':'model',
+  'stationary equipment class':'stationary_class', 'stationary maker':'stationary_maker',
+  'stationary model':'stationary_model', 'data':'date', 'date':'date',
+  'motivacao':'motivation', 'motivation':'motivation',
+  'executor':'executor', 'responsavel':'executor', 'método':'method', 'metodo':'method',
+  'method':'method', 'coupling gap':'coupling_gap', 'gap':'coupling_gap',
+  'padrão':'standard', 'padrao':'standard', 'standard':'standard',
+  'axial tolerance':'axial_tolerance', 'radial tolerance':'radial_tolerance',
+  'coupling gap tolerance':'gap_tolerance', 'document':'document', 'documento':'document'
+};
+
+const fold = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+const FIELD_KEYS = Object.fromEntries(Object.entries(FIELDS).map(([label, key]) => [fold(label), key]));
+
 function createConfirmations(file) {
   let state = {};
   try { state = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) { if (err.code !== 'ENOENT') throw err; }
-  function save() { const tmp = file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(state), {mode:0o600}); fs.renameSync(tmp,file); }
+  function save() {
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(state), {mode:0o600});
+    fs.renameSync(tmp, file);
+    fs.chmodSync(file, 0o600);
+  }
   return {
-    prepare(group, sessionId, vessel, equipment, fields, conflicts) {
-      const key = crypto.createHash('sha256').update(JSON.stringify([group,sessionId,fields,conflicts])).digest('hex');
-      if (state[key]) return null;
-      const lines = [`Registrei o alinhamento: ${vessel} — ${equipment}. Confira os dados:`];
-      for (const [name, value] of Object.entries(fields)) if (value && value !== 'não informado') lines.push(`${name}: ${value}`);
-      for (const c of conflicts) lines.push(`${c.field}: legenda ${c.caption}; imagem ${c.visual || 'não legível'}. Qual é o valor correto?`);
-      lines.push('Responda diretamente a esta mensagem. Para corrigir, informe o campo e o valor, por exemplo: axial vertical: -0,01 mm.');
-      // Persist before sending to prevent duplicate messages after a crash. A failed send requires review.
-      state[key] = {group, sessionId, vessel, equipment, fields, conflicts, status:'prepared'}; save();
-      return {key, text:lines.join('\n')};
+    prepare(group, sessionId, proposal) {
+      const canonical = JSON.stringify({group, sessionId, data:proposal.data, conflicts:proposal.conflicts});
+      const key = crypto.createHash('sha256').update(canonical).digest('hex');
+      if (state[key]?.status === 'sent') return null;
+      if (state[key]?.status === 'answered') return null;
+      for (const item of Object.values(state)) {
+        if (item.group === group && item.sessionId === sessionId && ['sent', 'answered'].includes(item.status)) item.status = 'superseded';
+      }
+      state[key] = {...proposal, group, sessionId, status:'prepared'};
+      save();
+      return {key, text:proposal.text};
     },
     sent(key, messageId) { state[key].messageId=messageId; state[key].status='sent'; save(); },
-    lookup(group, quotedId) { return Object.entries(state).find(([,v]) => v.group===group && v.messageId===quotedId && v.status==='sent') || null; },
-    done(key, responseId) { state[key].status='answered'; state[key].responseId=responseId; save(); }
+    lookup(group, quotedId) {
+      return Object.entries(state).find(([,v]) => v.group===group && v.messageId===quotedId && ['sent','answered','superseded'].includes(v.status)) || null;
+    },
+    done(key, responseId, status='answered') {
+      if (!state[key]) return;
+      state[key].status=status;
+      state[key].responseId=responseId;
+      save();
+    }
   };
 }
-function parseCorrection(text) {
- const matches=[...String(text).matchAll(/\b(axial|radial)\s+(vertical|horizontal)\s*[:=]?\s*([+-]?\d+(?:[.,]\d+)?)\s*(mm)?\b/gi)];
- return matches.map(m=>({key:FIELDS[(m[1]+' '+m[2]).toLowerCase()], value:m[3].replace(',','.')+' mm'}));
+
+function parseCorrection(text, conflicts = []) {
+  const corrections = [];
+  const source = String(text || '');
+  const labels = [...new Set(Object.keys(FIELDS).sort((a,b) => b.length-a.length))];
+  for (const line of source.split(/\r?\n/)) {
+    const match = line.trim().match(/^([^:=]+)\s*[:=]\s*(.+?)\s*$/);
+    if (!match) continue;
+    const key = FIELD_KEYS[fold(match[1])];
+    if (key && !['class','maker','model','stationary_class','stationary_maker','stationary_model'].includes(key)) {
+      let value = match[2].trim();
+      if (['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(key)) {
+        const measured = value.match(/^([+-]?\d+(?:[.,]\d+)?)\s*(mm)?$/i);
+        if (!measured) continue;
+        value = measured[1].replace(',', '.') + ' mm';
+      }
+      corrections.push({key, value});
+    }
+  }
+  const lower = fold(source);
+  for (const conflict of conflicts) {
+    const key = FIELD_KEYS[fold(conflict.field)];
+    if (!key || corrections.some(change => change.key === key)) continue;
+    const label = labels.find(item => FIELD_KEYS[fold(item)] === key);
+    if (!label) continue;
+    const pattern = new RegExp(`\\b${label.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s+([+-]?\\d+(?:[.,]\\d+)?)\\s*(?:mm)?\\b`, 'i');
+    const match = source.match(pattern);
+    if (match) corrections.push({key, value:match[1].replace(',', '.') + ' mm'});
+  }
+  if (!corrections.length && conflicts.length === 1) {
+    const key = FIELD_KEYS[fold(conflicts[0].field)];
+    const bare = source.trim().match(/^(?:é|e|o correto é|correto é|valor correto é|fica em)?\s*([+-]?\d+(?:[.,]\d+)?)\s*(?:mm)?[.!]?$/i);
+    if (key && bare) corrections.push({key, value:bare[1].replace(',', '.') + ' mm'});
+  }
+  const seen = new Set();
+  return corrections.filter(change => {
+    if (seen.has(change.key)) return false;
+    seen.add(change.key);
+    return true;
+  });
 }
-module.exports={createConfirmations,parseCorrection};
+
+function isApproval(text) {
+  return /^(?:(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|aprovado|aprovada)(?:[,;:\s]+(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|está correto|esta correto|está certo|esta certo|pode registrar|pode gravar|aprovado|aprovada))?|está correto|esta correto|está certo|esta certo|tudo certo|pode registrar|pode gravar)[.!?\s]*$/i.test(String(text || '').trim());
+}
+
+module.exports = {createConfirmations, parseCorrection, isApproval, fold};
