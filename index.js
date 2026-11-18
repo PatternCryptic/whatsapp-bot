@@ -206,7 +206,7 @@ if (geminiEnabled) {
           if (!column.mappedAs?.length) continue;
           for (const mappedAs of column.mappedAs) {
             const value = mappedAs === 'vessel' ? data.vessel : mappedAs === 'equipment' ? data.equipment : data[mappedAs];
-            const displayTitle = schema.filter(item => item.title === column.title && item.mappedAs?.some(key => key === mappedAs)).length > 1
+            const displayTitle = schema.filter(item => item.title === column.title && item.mappedAs?.length).length > 1
               ? `${column.title} (${column.group})` : column.title;
             shownFields.push({title:displayTitle, value:value || 'não informado'});
           }
