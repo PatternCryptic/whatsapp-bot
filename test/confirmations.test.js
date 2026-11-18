@@ -22,6 +22,10 @@ test('correção exige campo e preserva sinal e decimal',()=>{
  assert.deepEqual(parseCorrection('Embarcação: Bram Atlas\nEquipment / Tag: MCP 1'),[
    {key:'vessel',value:'Bram Atlas'},{key:'equipment',value:'MCP 1'}
  ]);
+ assert.deepEqual(parseCorrection('Maker (Drive Machine): WEG\nMaker (Máquina Estacionária): ABB'),[
+   {key:'maker',value:'WEG'},{key:'stationary_maker',value:'ABB'}
+ ]);
  assert.equal(isApproval('confirmo'),true);
+ assert.equal(isApproval('sim, correto'),true);
  assert.equal(isApproval('não, axial vertical: -0.01 mm'),false);
 });
