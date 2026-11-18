@@ -64,8 +64,14 @@ function parseCorrection(text, conflicts = []) {
   for (const line of source.split(/\r?\n/)) {
     const match = line.trim().match(/^([^:=]+)\s*[:=]\s*(.+?)\s*$/);
     if (!match) continue;
-    const key = FIELD_KEYS[fold(match[1])];
-    if (key && !['class','maker','model','stationary_class','stationary_maker','stationary_model'].includes(key)) {
+    const label = fold(match[1]);
+    const baseLabel = label.replace(/\s+\([^)]*\)$/, '');
+    const group = label.match(/\(([^)]*)\)$/)?.[1] || '';
+    let key = FIELD_KEYS[label] || FIELD_KEYS[baseLabel];
+    if (/stationary|estacionaria/.test(group)) {
+      key = ({class:'stationary_class',maker:'stationary_maker',model:'stationary_model'})[key] || key;
+    }
+    if (key) {
       let value = match[2].trim();
       if (['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(key)) {
         const measured = value.match(/^([+-]?\d+(?:[.,]\d+)?)\s*(mm)?$/i);
