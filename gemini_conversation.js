@@ -456,7 +456,24 @@ function verifyExtraction(result, transcript) {
   };
 
   const vessel = verifiedValue(result.vessel) || 'não informado';
-  const equipment = verifiedValue(result.equipment) || 'não informado';
+  const sections = transcript.flatMap((message, messageIndex) => {
+    const marker = 'Conteúdo lido do anexo:';
+    const text = String(message.text || '');
+    if (!text.includes(marker)) return [];
+    return text.slice(text.indexOf(marker) + marker.length).split(/--- OUTRO EQUIPAMENTO ---/i)
+      .map(section => ({ text: section, messageIndex }));
+  });
+  // A extração final precisa de um registro estruturalmente válido do Gemini.
+  // Se ele omitir a identidade, recupere-a apenas da leitura mais recente do anexo.
+  // Isso evita usar o primeiro anexo histórico para identificar a atividade atual.
+  const latestMessageIndex = sections.length ? sections[sections.length - 1].messageIndex : -1;
+  const latestSections = sections.filter(section => section.messageIndex === latestMessageIndex);
+  const names = [...new Set(latestSections.flatMap(({text}) => {
+    const match = text.match(/^\s*Equipamento:\s*(.+)$/im);
+    return match && match[1].trim() ? [match[1].trim()] : [];
+  }))];
+  const verifiedEquipment = verifiedValue(result.equipment);
+  const equipment = verifiedEquipment || (names.length === 1 ? names[0] : 'não informado');
 
   // Gemini por vezes simplifica um campo para string. Só aceita esse formato
   // quando a mesma medida aparece com o cabeçalho na seção do equipamento.
@@ -464,11 +481,9 @@ function verifyExtraction(result, transcript) {
     if (typeof value !== 'string' || !value.trim() || equipment === 'não informado') return null;
     const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pattern = new RegExp(`(?:^|\\n)${escape(fold(label))}:\\s*${escape(fold(value.trim()))}(?=\\s*\\(|\\s*$)`, 'm');
-    for (const message of transcript) {
-      for (const section of String(message.text || '').split(/--- OUTRO EQUIPAMENTO ---/i)) {
-        const normalized = fold(section);
-        if (normalized.includes(`equipamento: ${fold(equipment)}`) && pattern.test(normalized)) return value.trim();
-      }
+    for (const {text:section} of latestSections) {
+      const normalized = fold(section);
+      if (normalized.includes(`equipamento: ${fold(equipment)}`) && pattern.test(normalized)) return value.trim();
     }
     return null;
   };
@@ -477,6 +492,18 @@ function verifyExtraction(result, transcript) {
   for (const [key, label] of Object.entries(FIELD_LABELS)) {
     const value = verifiedValue(result.fields?.[key]) || verifiedString(result.fields?.[key], label);
     if (value) fields[label] = value;
+  }
+  if (equipment !== 'não informado' && names.length === 1 && fold(names[0]) === fold(equipment)) {
+    for (const [key, label] of Object.entries(FIELD_LABELS)) {
+      if (fields[label]) continue;
+      const candidates = latestSections.flatMap(({text:section}) => section.split('\n').flatMap(line => {
+        const match = line.match(/^([^:]+):\s*(.*?)\s+\(fonte:\s*(.+)\)$/i);
+        if (!match || fold(match[1].trim()) !== fold(label) || !match[2].trim()) return [];
+        return fold(match[3]).includes(fold(match[2])) ? [match[2].trim()] : [];
+      }));
+      const unique = [...new Set(candidates)];
+      if (unique.length === 1) fields[label] = unique[0];
+    }
   }
   const input = [`Vessel: ${vessel}`, `Equipment: ${equipment}`];
   for (const [label, value] of Object.entries(fields)) input.push(`${label}: ${value}`);
