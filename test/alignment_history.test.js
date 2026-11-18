@@ -75,6 +75,23 @@ test('mapeia títulos por nomes e distingue colunas repetidas pelo grupo', () =>
   assert.equal(row[23], 'session:abc');
 });
 
+test('grava nova linha a partir da coluna A mesmo com dados isolados à direita', async () => {
+  const rows = [
+    ['Drive Machine', '', 'Reference'],
+    ['Vessel', 'Equipment / Tag', 'Comments'],
+    ['Navio', 'MCP', 'session:anterior'],
+    Array(17).fill('').concat('dado isolado')
+  ];
+  let written;
+  const sheets = { spreadsheets: { values: {
+    get: async () => ({ data: { values: rows } }),
+    update: async request => { written = request; return { data: { updatedRange: request.range } }; }
+  } } };
+  await recordHistory(sheets, 'test', {vessel:'Outro navio', equipment:'DG 1'}, 'nova');
+  assert.equal(written.range, "'Modelo alinhamento'!A5:C5");
+  assert.deepEqual(written.requestBody.values[0], ['Outro navio', 'DG 1', 'session:nova']);
+});
+
 
 
 test('correção atualiza somente a linha identificada pela sessão e recusa duplicidade', async () => {
