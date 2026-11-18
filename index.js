@@ -20,7 +20,7 @@ if (geminiEnabled && !process.env.CONFIG_SPREADSHEET_ID) {
   throw new Error('GEMINI_CONVERSATION_ENABLED requer CONFIG_SPREADSHEET_ID.');
 }
 if (geminiEnabled) {
-  console.log('Gemini ativo em todos os grupos dos quais o bot participa; sessões isoladas por grupo.');
+  console.log('Gemini aguardará menção explícita antes de processar uma conversa do grupo.');
 }
 
 // ADC uses the VM's attached service account on Compute Engine.
@@ -92,14 +92,38 @@ let alignmentConfigPromise = null;
 const groupTitleCache = new Map();
 const {createConfirmations, parseCorrection} = require('./confirmations');
 const confirmations = createConfirmations(path.join(__dirname, 'alignment-confirmations.json'));
+const preMentionMessages = new Map();
+const armedGroups = new Map();
+const GROUP_ARM_WINDOW_MS = 2 * 60 * 60 * 1000;
+
+function messageContextInfo(content) {
+  return content.extendedTextMessage?.contextInfo || content.imageMessage?.contextInfo ||
+    content.documentMessage?.contextInfo || content.videoMessage?.contextInfo || {};
+}
+
+function jidDigits(value) {
+  return String(value || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+
+function explicitlyMentionsBot(sock, content) {
+  const own = jidDigits(sock.user?.id || sock.user?.lid);
+  if (!own) return false;
+  const mentions = messageContextInfo(content).mentionedJid || [];
+  return mentions.some(jid => jidDigits(jid) === own);
+}
+
+function cacheBeforeMention(group, msg) {
+  const now = Date.now();
+  const messages = (preMentionMessages.get(group) || []).filter(item => now - item.time < GROUP_ARM_WINDOW_MS);
+  messages.push({time:now, msg});
+  preMentionMessages.set(group, messages.slice(-60));
+}
+
 if (geminiEnabled) {
   const { createTracker, fileStore, makeGeminiFunctions, verifyExtractions } = require('./gemini_conversation');
   const { loadAlignmentConfig } = require('./alignment_config');
   const history = require('./alignment_history');
   const store = fileStore(sessionsFile);
-  // Suppress retroactive notices for sessions present before this process started.
-  const startupSessions = store.load() || {};
-  const baselineCounts = new Map(Object.entries(startupSessions).map(([group, session]) => [group + '|' + session.startedAt, (session.messages || []).length]));
   alignmentConfigPromise = loadAlignmentConfig(sheets, process.env.CONFIG_SPREADSHEET_ID);
   gemini = makeGeminiFunctions({
     apiKey: process.env.GEMINI_API_KEY,
@@ -108,9 +132,23 @@ if (geminiEnabled) {
     getRecordSchema: () => history.getRecordSchema(sheets, spreadsheetId),
     onExtract: async (session, reason, extraction, transcript) => {
       const checkedRecords = verifyExtractions(extraction, transcript);
-      const recorded = new Set();
-      let written = 0;
+      const proposed = new Set();
       let pending = 0;
+      let deliveryFailed = false;
+      const schema = await history.getRecordSchema(sheets, spreadsheetId);
+      const fieldKeys = {
+        'Equipment Class':'class', Maker:'maker', Model:'model',
+        'Stationary Equipment Class':'stationary_class', 'Stationary Maker':'stationary_maker',
+        'Stationary Model':'stationary_model', Document:'document', Data:'date',
+        Motivacao:'motivation', Motivation:'motivation', Executor:'executor', Metodo:'method', Method:'method',
+        'Axial vertical':'axial_vertical', 'Axial horizontal':'axial_horizontal',
+        'Radial vertical':'radial_vertical', 'Radial horizontal':'radial_horizontal',
+        'Coupling gap':'coupling_gap', 'Padrão':'standard', 'Axial tolerance':'axial_tolerance',
+        'Radial tolerance':'radial_tolerance', 'Coupling gap tolerance':'gap_tolerance'
+      };
+      const normalizeEquipment = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase().replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
+        .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
       for (const checked of checkedRecords) {
         if (!checked.ok) {
           pending += 1;
@@ -122,65 +160,83 @@ if (geminiEnabled) {
         const equipmentKey = String(checked.equipment).normalize('NFD').replace(/[\u0300-\u036f]/g, '')
           .toLowerCase().replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
           .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
-        if (recorded.has(equipmentKey)) {
+        if (proposed.has(equipmentKey)) {
           pending += 1;
           appendPending({ groupJid: session.group, startedAt: session.startedAt,
             reason: `equipamento duplicado na extração: ${checked.equipment}`, messages: session.messages });
           continue;
         }
-        recorded.add(equipmentKey);
+        proposed.add(equipmentKey);
         const sessionId = crypto.createHash('sha256')
           .update(`${session.group}|${session.startedAt}|${equipmentKey}`).digest('hex').slice(0, 24);
-        const fields = checked.fields || {};
-        const result = await history.recordHistory(sheets, spreadsheetId, {
+        const extracted = checked.fields || {};
+        const data = {
           vessel: checked.vessel, equipment: checked.equipment,
-          class: fields['Equipment Class'], maker: fields.Maker, model: fields.Model,
-          stationary_class: fields['Stationary Equipment Class'], stationary_maker: fields['Stationary Maker'],
-          stationary_model: fields['Stationary Model'], document: fields.Document,
-          date: fields.Data, motivation: fields.Motivacao, executor: fields.Executor, method: fields.Metodo,
-          axial_vertical: fields['Axial vertical'], axial_horizontal: fields['Axial horizontal'],
-          radial_vertical: fields['Radial vertical'], radial_horizontal: fields['Radial horizontal'],
-          coupling_gap: fields['Coupling gap'], standard: fields['Padrão'],
-          axial_tolerance: fields['Axial tolerance'], radial_tolerance: fields['Radial tolerance'],
-          gap_tolerance: fields['Coupling gap tolerance'],
-          observations: Object.entries(fields).filter(([key]) => /antes do ajuste|unidade das medições/i.test(key))
+          class: extracted['Equipment Class'], maker: extracted.Maker, model: extracted.Model,
+          stationary_class: extracted['Stationary Equipment Class'], stationary_maker: extracted['Stationary Maker'],
+          stationary_model: extracted['Stationary Model'], document: extracted.Document,
+          date: extracted.Data, motivation: extracted.Motivacao || extracted.Motivation,
+          executor: extracted.Executor, method: extracted.Metodo || extracted.Method,
+          axial_vertical: extracted['Axial vertical'], axial_horizontal: extracted['Axial horizontal'],
+          radial_vertical: extracted['Radial vertical'], radial_horizontal: extracted['Radial horizontal'],
+          coupling_gap: extracted['Coupling gap'], standard: extracted['Padrão'],
+          axial_tolerance: extracted['Axial tolerance'], radial_tolerance: extracted['Radial tolerance'],
+          gap_tolerance: extracted['Coupling gap tolerance'],
+          observations: Object.entries(extracted).filter(([key]) => /antes do ajuste|unidade das medições/i.test(key))
             .map(([key, value]) => `${key}: ${value}`).join('; ')
-        }, sessionId);
-        if (['appended', 'updated', 'duplicate', 'conflict', 'unchanged'].includes(result.status)) written += 1;
-        const identityNeedsClarification = checked.vessel === 'não informado' || checked.equipment === 'não informado';
-        if (!['appended', 'updated', 'duplicate', 'unchanged'].includes(result.status) || identityNeedsClarification) {
-          appendPending({ groupJid: session.group, startedAt: session.startedAt,
-            closedAt: new Date().toISOString(), equipment: checked.equipment,
-            reason: identityNeedsClarification
-              ? { message: 'Embarcação ou equipamento não puderam ser associados com segurança; linha registrada com não informado.', result }
-              : result, messages: session.messages });
-        }
-        if (activeSock && !identityNeedsClarification && session.messages.length > (baselineCounts.get(session.group + '|' + session.startedAt) || 0) && ['appended','updated','conflict'].includes(result.status)) {
+        };
+        const conflicts = [];
+        let currentEquipment = '';
+        for (const msg of session.messages) for (const line of String(msg.text || '').split('\n')) {
+          const equipmentMatch = line.match(/^Equipamento:\s*(.+)$/i);
+          if (equipmentMatch) currentEquipment = equipmentMatch[1].trim();
+          if (!line.startsWith('DIVERGENCIA_MEDICAO: ')) continue;
           try {
-            const current = await history.findSession(sheets, spreadsheetId, sessionId);
-            const shown = {};
-            for (const [key,col] of Object.entries(current.cols)) {
-              if (key === 'comments' || key.startsWith('stationary_')) continue;
-              const value = current.row[col];
-              if (value && String(value).toLowerCase() !== 'não informado') shown[current.headers[col]] = String(value);
-            }
-            const conflicts = [];
-            if (checkedRecords.length === 1) for (const msg of session.messages) {
-              for (const line of String(msg.text || '').split('\n')) if (line.startsWith('DIVERGENCIA_MEDICAO: ')) {
-                try { conflicts.push(JSON.parse(line.slice('DIVERGENCIA_MEDICAO: '.length))); } catch {}
-              }
-            }
-            const prompt = confirmations.prepare(session.group, sessionId, checked.vessel, checked.equipment, shown, conflicts);
-            if (prompt) {
-              const sent = await activeSock.sendMessage(session.group, {text:prompt.text});
-              if (!sent?.key?.id) throw new Error('Mensagem sem identificador');
-              confirmations.sent(prompt.key, sent.key.id);
-            }
-          } catch (error) { appendPending({groupJid:session.group, sessionId, reason:'confirmação não enviada ou pendente de revisão: '+error.message}); }
+            const conflict = JSON.parse(line.slice('DIVERGENCIA_MEDICAO: '.length));
+            if ((normalizeEquipment(currentEquipment) === equipmentKey || checkedRecords.length === 1) &&
+                !conflicts.some(item => item.field === conflict.field)) conflicts.push(conflict);
+          } catch {}
         }
-        console.log('Registro de alinhamento:', checked.equipment, result.status);
+        for (const conflict of conflicts) {
+          const key = fieldKeys[conflict.field] || fieldKeys[conflict.field[0]?.toUpperCase() + conflict.field.slice(1)];
+          if (key) data[key] = 'usuário passou informação divergente';
+        }
+        const shownFields = [];
+        for (const column of schema) {
+          if (!column.mappedAs?.length) continue;
+          for (const mappedAs of column.mappedAs) {
+            const value = mappedAs === 'vessel' ? data.vessel : mappedAs === 'equipment' ? data.equipment : data[mappedAs];
+            const displayTitle = schema.filter(item => item.title === column.title && item.mappedAs?.some(key => key === mappedAs)).length > 1
+              ? `${column.title} (${column.group})` : column.title;
+            shownFields.push({title:displayTitle, value:value || 'não informado'});
+          }
+        }
+        const displayLines = shownFields.map(item => `${item.title}: ${item.value}`);
+        for (const conflict of conflicts) {
+          displayLines.push(`Divergência ${conflict.field}: legenda ${conflict.caption || 'não informada'}; imagem ${conflict.visual || 'não legível'}.`);
+        }
+        const text = [
+          `O Gemini interpretou o alinhamento de ${data.vessel} — ${data.equipment}. Confira antes de gravar na planilha:`,
+          ...displayLines,
+          conflicts.length ? 'Se confirmar sem corrigir uma divergência, a célula receberá “usuário passou informação divergente”.' : '',
+          'Responda a esta mensagem com “confirmo” para gravar ou informe as correções no formato “Axial Vertical: -0,01 mm”.'
+        ].filter(Boolean).join('\n');
+        const prompt = confirmations.prepare(session.group, sessionId, {
+          data, conflicts, text, startedAt:session.startedAt, messages:session.messages
+        });
+        if (prompt && activeSock) {
+          try {
+            const sent = await activeSock.sendMessage(session.group, {text:prompt.text});
+            if (!sent?.key?.id) throw new Error('Mensagem sem identificador');
+            confirmations.sent(prompt.key, sent.key.id);
+          } catch (error) {
+            deliveryFailed = true;
+            appendPending({groupJid:session.group, sessionId, reason:'proposta pendente: confirmação não enviada: '+error.message});
+          }
+        }
+        console.log('Interpretação aguardando validação:', checked.equipment);
       }
-      return {written, pending};
+      return {proposed:proposed.size, pending, deliveryFailed};
     }
   });
 
@@ -197,13 +253,18 @@ if (geminiEnabled) {
         return 'uncertain';
       }
     },
-    // Monitoramento silencioso; dados são sincronizados periodicamente.
+    // Analisa a cada cinco minutos e só propõe a gravação depois de uma menção explícita.
     onMessage: async () => {},
     onTick: async (session) => {
-      try { await gemini.finish(session, 'sincronização periódica'); return true; }
+      if (!session.activatedByMention) return true;
+      try {
+        const result = await gemini.finish(session, 'sincronização periódica');
+        return result?.deliveryFailed ? false : true;
+      }
       catch (error) { console.error('Falha ao sincronizar dados de alinhamento:', error.message); return false; }
     },
     finish: async (session, reason) => {
+      if (!session.activatedByMention) return;
       try {
         await gemini.finish(session, reason);
       } catch (error) {
@@ -219,7 +280,7 @@ if (geminiEnabled) {
     },
     save: (state) => store.save(state),
     load: () => store.load(),
-    timeoutMs: Number.MAX_SAFE_INTEGER,
+    timeoutMs: 2 * 60 * 60 * 1000,
     maxMessages: 5000
   });
 
@@ -230,7 +291,7 @@ if (geminiEnabled) {
   }, 5 * 60 * 1000).unref();
 }
 
-async function handleMessage(sock, msg) {
+async function handleMessage(sock, msg, options = {}) {
   const groupJid = msg.key.remoteJid || '';
   if (!groupJid.endsWith('@g.us') || msg.key.fromMe) return;
 
@@ -244,37 +305,92 @@ async function handleMessage(sock, msg) {
   const messageId = msg.key.id;
   if (messageId && seenIds.has(messageId)) return;
 
-  if (!attachment && /\b(?:relat[oó]rio|report)\b/i.test(text)) {
-    console.log('Mensagem sobre relatório sem anexo reconhecido:', groupJid, messageId);
-  }
-
   if (geminiEnabled) {
-    const contextInfo = content.extendedTextMessage?.contextInfo || content.imageMessage?.contextInfo || content.documentMessage?.contextInfo;
+    const contextInfo = messageContextInfo(content);
     const confirmation = contextInfo?.stanzaId && confirmations.lookup(groupJid, contextInfo.stanzaId);
     if (confirmation) {
       const [key, entry] = confirmation;
-      let corrections = parseCorrection(text);
-      const numericReply = text.trim().match(/^([+-]?\d+(?:[.,]\d+)?)\s*(?:mm)?[.!]?$/i);
-      if (!corrections.length && numericReply && entry.conflicts.length === 1) {
-        const key = entry.conflicts[0].field.toLowerCase().replace(/\s+/g, '_');
-        if (['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(key)) corrections = [{key, value:numericReply[1].replace(',', '.') + ' mm'}];
+      if (entry.status === 'superseded') {
+        if (messageId) { seenIds.add(messageId); saveSeenIds(); }
+        try { await sock.sendMessage(groupJid, {text:'Esta interpretação foi substituída por uma mais recente. Responda à última mensagem de conferência do bot.', quoted:msg}); } catch {}
+        return;
       }
-      if (corrections.length) {
-        const required = entry.conflicts.map(c => c.field.toLowerCase().replace(/\s+/g, '_'));
-        if (required.some(field => !corrections.some(c => c.key === field))) { appendPending({groupJid, messageId, reason:'resposta não resolveu todas as divergências'}); return; }
-        if (new Set(corrections.map(x=>x.key)).size !== corrections.length) {
-          appendPending({groupJid, messageId, reason:'resposta com medições duplicadas'}); return;
-        }
-        await require('./alignment_history').correctSession(sheets, spreadsheetId, entry.sessionId, corrections);
-        confirmations.done(key, messageId);
+      const corrections = parseCorrection(text, entry.conflicts || []);
+      const approved = require('./confirmations').isApproval(text);
+      if (entry.status === 'answered' && !corrections.length) {
         if (messageId) { seenIds.add(messageId); saveSeenIds(); }
-      } else if (/^(?:sim|correto|corretos|confirmo|confirmado|ok|certo)[.!\s]*$/i.test(text)) {
-        if (entry.conflicts.length) { appendPending({groupJid, messageId, reason:'confirmação genérica com divergência pendente'}); return; }
-        confirmations.done(key, messageId);
-        if (messageId) { seenIds.add(messageId); saveSeenIds(); }
-      } else appendPending({groupJid, messageId, reason:'resposta de confirmação não reconhecida'});
+        return;
+      }
+      if (!corrections.length && !approved) {
+        appendPending({groupJid, messageId, reason:'resposta de validação não reconhecida'});
+        try { await sock.sendMessage(groupJid, {text:'Não consegui identificar a confirmação ou correção. Responda “confirmo” ou informe o campo e o valor, por exemplo: Axial Vertical: -0,01 mm.', quoted:msg}); } catch {}
+        return;
+      }
+      const data = {...entry.data};
+      for (const correction of corrections) data[correction.key] = correction.value;
+      const conflicts = (entry.conflicts || []).filter(conflict => {
+        const correction = corrections.find(item => item.key === parseCorrection(`${conflict.field}: 0`, [])[0]?.key);
+        return !correction;
+      });
+      for (const conflict of conflicts) {
+        const normalized = String(conflict.field || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        const key = ({'axial vertical':'axial_vertical','axial horizontal':'axial_horizontal',
+          'radial vertical':'radial_vertical','radial horizontal':'radial_horizontal'})[normalized];
+        if (key) data[key] = 'usuário passou informação divergente';
+      }
+      if (!data.vessel || data.vessel === 'não informado' || !data.equipment || data.equipment === 'não informado') {
+        appendPending({groupJid, messageId, reason:'identidade do alinhamento ainda não foi informada com segurança'});
+        try { await sock.sendMessage(groupJid, {text:'Preciso confirmar a embarcação e o equipamento antes de gravar. Responda com “Embarcação: ...” e “Equipamento: ...”.', quoted:msg}); } catch {}
+        return;
+      }
+      const normalizeEquipment = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase().replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
+        .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
+      const sessionId = crypto.createHash('sha256')
+        .update(`${groupJid}|${entry.startedAt}|${normalizeEquipment(data.equipment)}`).digest('hex').slice(0, 24);
+      const conflictNotes = conflicts.map(item => `${item.field}: legenda ${item.caption || 'não informada'}; imagem ${item.visual || 'não legível'}`).join('; ');
+      data.observations = [data.observations, conflictNotes].filter(Boolean).join('; ');
+      data.groupJid = groupJid;
+      data.recordedAt = new Date().toISOString();
+      const overwriteFields = Object.entries(data)
+        .filter(([key, value]) => key !== 'observations' && value != null && String(value).trim() &&
+          String(value).trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase() !== 'nao informado')
+        .map(([key]) => key);
+      const result = await require('./alignment_history').recordHistory(sheets, spreadsheetId, data, sessionId, {overwriteFields});
+      if (!['appended','updated','deduplicated','unchanged'].includes(result.status)) {
+        appendPending({groupJid, messageId, sessionId, result, reason:'não foi possível gravar com segurança após a validação'});
+        try { await sock.sendMessage(groupJid, {text:result.status === 'ambiguous_duplicate'
+          ? 'Encontrei mais de uma linha recente para este mesmo equipamento e não consegui escolher com segurança. Preciso revisar a planilha antes de gravar.'
+          : 'A validação foi recebida, mas a planilha indicou um conflito. O registro ficou pendente para revisão.' , quoted:msg}); } catch {}
+        return;
+      }
+      confirmations.done(key, messageId, 'answered');
+      if (messageId) { seenIds.add(messageId); saveSeenIds(); }
+      try { await sock.sendMessage(groupJid, {text:`Dados validados e gravados na linha ${result.row || 'existente'} da planilha.`, quoted:msg}); } catch {}
       return;
     }
+
+    const mentioned = explicitlyMentionsBot(sock, content);
+    const activeSession = alignmentTracker?.snapshot?.()[groupJid];
+    const active = armedGroups.get(groupJid) > Date.now() || activeSession?.activatedByMention === true;
+    if (!options.replay && !mentioned && !active) {
+      cacheBeforeMention(groupJid, msg);
+      return;
+    }
+    if (mentioned && !options.replay) {
+      const buffered = (preMentionMessages.get(groupJid) || []).filter(item => Date.now() - item.time < GROUP_ARM_WINDOW_MS);
+      preMentionMessages.delete(groupJid);
+      armedGroups.set(groupJid, Date.now() + GROUP_ARM_WINDOW_MS);
+      if (activeSession && !activeSession.activatedByMention) await alignmentTracker.clearGroup?.(groupJid);
+      for (const item of buffered) await handleMessage(sock, item.msg, {replay:true, activated:true});
+      return handleMessage(sock, msg, {replay:true, activated:true});
+    }
+    if (active || options.activated) armedGroups.set(groupJid, Date.now() + GROUP_ARM_WINDOW_MS);
+
+    if (!attachment && /\b(?:relat[oó]rio|report)\b/i.test(text)) {
+      console.log('Mensagem sobre relatório sem anexo reconhecido:', groupJid, messageId);
+    }
+
     let groupName = groupTitleCache.get(groupJid)?.name || '';
     if (!groupName || Date.now() - groupTitleCache.get(groupJid).time > 60 * 60 * 1000) {
       try {
@@ -340,6 +456,7 @@ async function handleMessage(sock, msg) {
       timestamp,
       sender: msg.pushName || '',
       groupName,
+      activatedByMention: options.activated === true || active,
       text: groupName ? `[Grupo: ${groupName}]\n${text}` : text
     });
     if (outcome !== 'ignorada' && messageId) {
@@ -374,7 +491,7 @@ async function startBot() {
       qrcode.generate(qr, { small: true });
     }
     if (connection === 'open') console.log(geminiEnabled
-      ? 'Coletor conectado em modo silencioso.'
+      ? 'Coletor conectado; aguardando menção explícita em um grupo.'
       : 'Coletor conectado em modo silencioso.');
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
