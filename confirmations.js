@@ -2,6 +2,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 
 const FIELDS = {
+  'linha da planilha':'existingRow',
   'vessel':'vessel', 'embarcação':'vessel', 'embarcacao':'vessel', 'navio':'vessel',
   'equipment':'equipment', 'equipment / tag':'equipment', 'equipment/tag':'equipment',
   'tag do equipamento':'equipment', 'equipment id':'equipment', 'equipamento':'equipment',
@@ -85,6 +86,7 @@ function parseCorrection(text, conflicts = []) {
     }
     if (key) {
       let value = match[2].trim();
+      if (key === 'existingRow' && !/^[3-9]$|^[1-9]\d+$/.test(value)) continue;
       if (['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(key)) {
         const measured = value.match(/^([+-]?\d+(?:[.,]\d+)?)\s*(mm|cm|µm|μm|um|mils?|in|pol)$/i);
         if (!measured) continue;

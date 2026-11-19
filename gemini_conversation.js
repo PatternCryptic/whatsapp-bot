@@ -405,10 +405,7 @@ function makeGeminiFunctions({ apiKey, model, onExtract, config, getRecordSchema
   }
 
   async function finish(session, reason) {
-    const reportIndex = session.messages.findIndex(message =>
-      String(message.text || '').includes('Conteúdo lido do anexo:'));
-    const relevantMessages = reportIndex >= 0 ? session.messages.slice(reportIndex) : session.messages;
-    const transcript = relevantMessages.map((message, index) => ({
+    const transcript = session.messages.map((message, index) => ({
       n: index + 1,
       time: message.timestamp,
       sender: message.sender,
