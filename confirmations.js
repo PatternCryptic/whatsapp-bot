@@ -16,7 +16,8 @@ const FIELDS = {
   'method':'method', 'coupling gap':'coupling_gap', 'gap':'coupling_gap',
   'padrão':'standard', 'padrao':'standard', 'standard':'standard',
   'axial tolerance':'axial_tolerance', 'radial tolerance':'radial_tolerance',
-  'coupling gap tolerance':'gap_tolerance', 'document':'document', 'documento':'document'
+  'coupling gap tolerance':'gap_tolerance', 'document':'document', 'documento':'document',
+  'comments':'observations', 'observações':'observations', 'observacao':'observations'
 };
 
 const fold = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
@@ -33,18 +34,29 @@ function createConfirmations(file) {
   }
   return {
     prepare(group, sessionId, proposal) {
-      const canonical = JSON.stringify({group, sessionId, data:proposal.data, conflicts:proposal.conflicts});
+      const canonical = JSON.stringify({group, sessionId, data:proposal.data, conflicts:proposal.conflicts,
+        target:proposal.target?.revision, sourceVersion:proposal.sourceVersion, parentKey:proposal.parentKey, text:proposal.text});
       const key = crypto.createHash('sha256').update(canonical).digest('hex');
       if (state[key]?.status === 'sent') return null;
       if (state[key]?.status === 'answered') return null;
-      for (const item of Object.values(state)) {
-        if (item.group === group && item.sessionId === sessionId && ['sent', 'answered'].includes(item.status)) item.status = 'superseded';
-      }
+      if (!proposal.parentKey && proposal.sourceVersion && Object.values(state).some(item =>
+        item.group === group && item.sessionId === sessionId && item.sourceVersion === proposal.sourceVersion &&
+        (item.status === 'answered' || (item.parentKey && item.status === 'sent')))) return null;
       state[key] = {...proposal, group, sessionId, status:'prepared'};
       save();
       return {key, text:proposal.text};
     },
-    sent(key, messageId) { state[key].messageId=messageId; state[key].status='sent'; save(); },
+    sent(key, messageId) {
+      const proposal = state[key];
+      for (const [otherKey, item] of Object.entries(state)) {
+        if (otherKey !== key && item.group === proposal.group && item.sessionId === proposal.sessionId && ['sent', 'answered'].includes(item.status)) {
+          item.status = 'superseded';
+        }
+      }
+      proposal.messageId = messageId;
+      proposal.status = 'sent';
+      save();
+    },
     lookup(group, quotedId) {
       return Object.entries(state).find(([,v]) => v.group===group && v.messageId===quotedId && ['sent','answered','superseded'].includes(v.status)) || null;
     },
@@ -74,26 +86,25 @@ function parseCorrection(text, conflicts = []) {
     if (key) {
       let value = match[2].trim();
       if (['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(key)) {
-        const measured = value.match(/^([+-]?\d+(?:[.,]\d+)?)\s*(mm)?$/i);
+        const measured = value.match(/^([+-]?\d+(?:[.,]\d+)?)\s*(mm|cm|µm|μm|um|mils?|in|pol)$/i);
         if (!measured) continue;
-        value = measured[1].replace(',', '.') + ' mm';
+        value = `${measured[1].replace(',', '.')} ${measured[2].toLowerCase()}`;
       }
       corrections.push({key, value});
     }
   }
-  const lower = fold(source);
   for (const conflict of conflicts) {
     const key = FIELD_KEYS[fold(conflict.field)];
     if (!key || corrections.some(change => change.key === key)) continue;
     const label = labels.find(item => FIELD_KEYS[fold(item)] === key);
     if (!label) continue;
-    const pattern = new RegExp(`\\b${label.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s+([+-]?\\d+(?:[.,]\\d+)?)\\s*(?:mm)?\\b`, 'i');
+    const pattern = new RegExp(`\\b${label.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s+([+-]?\\d+(?:[.,]\\d+)?)\\s*mm\\b`, 'i');
     const match = source.match(pattern);
     if (match) corrections.push({key, value:match[1].replace(',', '.') + ' mm'});
   }
   if (!corrections.length && conflicts.length === 1) {
     const key = FIELD_KEYS[fold(conflicts[0].field)];
-    const bare = source.trim().match(/^(?:é|e|o correto é|correto é|valor correto é|fica em)?\s*([+-]?\d+(?:[.,]\d+)?)\s*(?:mm)?[.!]?$/i);
+    const bare = source.trim().match(/^(?:é|e|o correto é|correto é|valor correto é|fica em)?\s*([+-]?\d+(?:[.,]\d+)?)\s*mm[.!]?$/i);
     if (key && bare) corrections.push({key, value:bare[1].replace(',', '.') + ' mm'});
   }
   const seen = new Set();
@@ -105,7 +116,7 @@ function parseCorrection(text, conflicts = []) {
 }
 
 function isApproval(text) {
-  return /^(?:(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|aprovado|aprovada)(?:[,;:\s]+(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|está correto|esta correto|está certo|esta certo|pode registrar|pode gravar|aprovado|aprovada))?|está correto|esta correto|está certo|esta certo|tudo certo|pode registrar|pode gravar)[.!?\s]*$/i.test(String(text || '').trim());
+  return /^(?:(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|aprovado|aprovada)(?:[,;:\s]+(?:sim|ok|confirmo|confirmado|correto|corretos|certo|certa|está correto|esta correto|está certo|esta certo|pode registrar|pode gravar|aprovado|aprovada))?|está correto|esta correto|está certo|esta certo|tudo certo|pode registrar|pode gravar)[.!\s]*$/i.test(String(text || '').trim());
 }
 
 module.exports = {createConfirmations, parseCorrection, isApproval, fold};

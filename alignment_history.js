@@ -1,4 +1,14 @@
-const normalize = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().replace(/\s+/g, ' ').toLowerCase();
+const { createHash } = require('node:crypto');
+
+const TAB = "'Modelo alinhamento'";
+const NEW_EQUIPMENT_INTERVAL_MS = 2 * 60 * 60 * 1000;
+const normalize = value => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().replace(/\s+/g, ' ').toLowerCase();
+const isKnown = value => !['', 'nao informado', 'desconhecido'].includes(normalize(value));
+const equipmentIdentity = value => normalize(value)
+  .replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset|dg)\s*#?\s*(\d+)\b/g, 'dg$1')
+  .replace(/[^a-z0-9]/g, '');
+const sameEquipment = (first, second) =>
+  normalize(first.vessel) === normalize(second.vessel) && equipmentIdentity(first.equipment) === equipmentIdentity(second.equipment);
 
 // Preserva dados conhecidos e retorna conflitos para revisão humana.
 function mergeKnownFields(existing, incoming) {
@@ -29,7 +39,8 @@ function mapHeaders(rows) {
   const headers = rows[1] || [];
   const groupAt = [];
   let activeGroup = '';
-  for (const [i, value] of groups.entries()) {
+  for (let i = 0; i < headers.length; i++) {
+    const value = groups[i];
     if (String(value || '').trim()) activeGroup = normalize(value);
     groupAt[i] = activeGroup;
   }
@@ -38,139 +49,171 @@ function mapHeaders(rows) {
     const matches = headers.map((h, i) => aliases.includes(normalize(h)) ? i : -1).filter(i => i >= 0);
     if (matches.length === 1 && ['stationary_class','stationary_maker','stationary_model'].includes(key)) {
       if ((groupAt[matches[0]] || '').includes('maquina estacionaria')) cols[key] = matches[0];
-    } else if (matches.length === 1) cols[key] = matches[0];
+    } else if (matches.length === 1) {
+      if (!['maker', 'model', 'class'].includes(key) || !groupAt[matches[0]]?.includes('maquina estacionaria')) cols[key] = matches[0];
+    }
     else if (matches.length > 1 && ['maker', 'model', 'class'].includes(key)) {
-      const drive = matches.find(i => groupAt[i].includes('drive machine'));
-      if (drive !== undefined) cols[key] = drive;
+      const drive = matches.filter(i => groupAt[i]?.includes('drive machine'));
+      if (drive.length === 1) cols[key] = drive[0];
     } else if (matches.length > 1 && ['stationary_class','stationary_maker','stationary_model'].includes(key)) {
-      const stationary = matches.find(i => groupAt[i].includes('maquina estacionaria') || groupAt[i].includes('máquina estacionária'));
-      if (stationary !== undefined) cols[key] = stationary;
+      const stationary = matches.filter(i => groupAt[i]?.includes('maquina estacionaria'));
+      if (stationary.length === 1) cols[key] = stationary[0];
     }
   }
   return { groups, headers, cols };
-}
-
-function makeRow(width, cols, data, sessionId) {
-  const row = Array(width).fill('não informado');
-  const set = (key, value) => { if (cols[key] !== undefined) row[cols[key]] = value == null || String(value).trim() === '' ? 'não informado' : String(value); };
-  for (const key of Object.keys(cols)) if (key !== 'comments') set(key, data[key]);
-  const metadata = [`session:${sessionId}`];
-  if (data.groupJid) metadata.push(`group:${data.groupJid}`);
-  metadata.push(`recorded_at:${data.recordedAt || new Date().toISOString()}`);
-  set('comments', [data.observations, ...metadata].filter(Boolean).join(' | '));
-  return row;
 }
 
 async function getRecordSchema(sheets, spreadsheetId) {
   const { data } = await sheets.spreadsheets.values.get({ spreadsheetId, range: "'Modelo alinhamento'!A1:ZZ2" });
   const { groups, headers, cols } = mapHeaders(data.values || []);
   if (!headers.length) throw new Error('Cabeçalhos da planilha de registros ausentes');
-  const populated = new Set(Object.keys(cols));
+  return describeColumns(groups, headers, cols);
+}
+
+function describeColumns(groups, headers, cols) {
   let group = '';
   return headers.map((title, index) => {
     if (groups[index]) group = groups[index];
-    return { group, title, mappedAs: Object.keys(cols).filter(key => populated.has(key) && cols[key] === index) };
+    return { group, title, mappedAs: Object.keys(cols).filter(key => cols[key] === index) };
   }).filter(column => column.title);
 }
 
-async function recordHistory(sheets, spreadsheetId, data, sessionId, { dryRun = false, overwriteFields = [] } = {}) {
-  const range = "'Modelo alinhamento'!A1:ZZ";
-  const { data: result } = await sheets.spreadsheets.values.get({ spreadsheetId, range });
-  const values = result.values || [];
-  const { headers, cols } = mapHeaders(values);
-  if (!headers.length || cols.vessel === undefined || cols.equipment === undefined || cols.comments === undefined) {
-    throw new Error('Cabeçalhos necessários ausentes ou ambíguos; nenhuma linha foi gravada');
-  }
-  if (dryRun) return { status: 'validated', columns: Object.keys(cols) };
-  let existingIndex = values.findIndex((row, index) => index >= 2 &&
-    String(row[cols.comments] || '').split(/\s*\|\s*/).includes(`session:${sessionId}`));
-  let deduplicatedByIdentity = false;
-  if (existingIndex < 0 && cols.vessel !== undefined && cols.equipment !== undefined) {
-    const normalizeEquipment = value => normalize(value)
-      .replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
-      .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
-    const timestamp = new Date(data.recordedAt || Date.now()).getTime();
-    const vessel = normalize(data.vessel);
-    const equipment = normalizeEquipment(data.equipment);
-    const matches = values.map((row, index) => {
-      if (index < 2 || normalize(row[cols.vessel]) !== vessel || normalizeEquipment(row[cols.equipment]) !== equipment) return null;
-      const comments = String(row[cols.comments] || '');
-      const recorded = comments.match(/(?:^|\s\|\s*)recorded_at:(\S+)/i)?.[1];
-      const recordedAt = recorded ? new Date(recorded).getTime() : NaN;
-      return Number.isFinite(recordedAt) && timestamp >= recordedAt && timestamp - recordedAt < 2 * 60 * 60 * 1000
-        ? index : null;
-    }).filter(index => index !== null);
-    if (matches.length > 1) return {status:'ambiguous_duplicate', rows:matches.map(index => index + 1)};
-    if (matches.length === 1) {
-      existingIndex = matches[0];
-      deduplicatedByIdentity = true;
-    }
-  }
-  const row = makeRow(headers.length, cols, data, sessionId);
-  if (existingIndex >= 2) {
-    const existing = values[existingIndex] || [];
-    const merged = [...existing];
-    while (merged.length < headers.length) merged.push('');
-    const conflicts = [];
-    for (const [key, col] of Object.entries(cols)) {
-      if (key === 'comments') continue;
-      const oldValue = String(existing[col] || '').trim();
-      const newValue = String(row[col] || '').trim();
-      if (deduplicatedByIdentity && ['vessel','equipment'].includes(key)) continue;
-      if (overwriteFields.includes(key) && newValue && normalize(newValue) !== 'nao informado') {
-        merged[col] = newValue;
-        continue;
-      }
-      if (!oldValue || normalize(oldValue) === 'nao informado') merged[col] = newValue || 'não informado';
-      else if (newValue && normalize(newValue) !== 'nao informado' && normalize(oldValue) !== normalize(newValue)) conflicts.push(headers[col]);
-    }
-    {
-      const oldComments = String(existing[cols.comments] || '');
-      const metadata = oldComments.split(/\s*\|\s*/).filter(part => !/^recorded_at:/i.test(part));
-      if (!metadata.includes(`session:${sessionId}`)) metadata.push(`session:${sessionId}`);
-      if (data.groupJid && !metadata.includes(`group:${data.groupJid}`)) metadata.push(`group:${data.groupJid}`);
-      metadata.push(`recorded_at:${data.recordedAt || new Date().toISOString()}`);
-      merged[cols.comments] = metadata.filter(Boolean).join(' | ');
-    }
-    if (conflicts.length) {
-      const oldComments = String(merged[cols.comments] || '');
-      const note = `Conflito para revisão: ${conflicts.join(', ')}`;
-      if (!oldComments.includes(note)) merged[cols.comments] = `${oldComments} | ${note}`.trim();
-    }
-    const changed = merged.some((value, i) => String(value || '') !== String(existing[i] || ''));
-    if (!changed) return {status:'unchanged', row:existingIndex + 1};
-    const { data: updated } = await sheets.spreadsheets.values.update({
-      spreadsheetId,
-      range: `'Modelo alinhamento'!A${existingIndex + 1}:${columnLetter(headers.length)}${existingIndex + 1}`,
-      valueInputOption: 'RAW', requestBody: { values: [merged] }
-    });
-    if (conflicts.length) return { status: 'conflict', row: existingIndex + 1, fields: conflicts, updatedRange: updated.updatedRange };
-    return { status: deduplicatedByIdentity ? 'deduplicated' : 'updated', row:existingIndex + 1, updatedRange: updated.updatedRange };
-  }
-  const nextRow = Math.max(3, values.length + 1);
-  const { data: appended } = await sheets.spreadsheets.values.update({
-    spreadsheetId, range: `'Modelo alinhamento'!A${nextRow}:${columnLetter(headers.length)}${nextRow}`, valueInputOption: 'RAW',
-    requestBody: { values: [row] }
-  });
-  return { status: 'appended', updatedRange: appended.updatedRange };
+
+const markerParts = value => String(value ?? '').split(/\s*\|\s*/).filter(Boolean);
+const userComments = value => markerParts(value).filter(part => !/^(?:session|confirmation|group|recorded_at):/i.test(part)).join(' | ');
+const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+function dateIdentity(value) {
+  const text = String(value ?? '').trim();
+  const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|T)/);
+  if (iso) return iso.slice(1).join('-');
+  const local = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  return local ? [local[3], local[2].padStart(2, '0'), local[1].padStart(2, '0')].join('-') : '';
 }
 
-async function findSession(sheets, spreadsheetId, sessionId) {
-  const {data} = await sheets.spreadsheets.values.get({spreadsheetId, range:"'Modelo alinhamento'!A1:ZZ1001"});
-  const rows=data.values || []; const {headers,cols}=mapHeaders(rows);
-  if (cols.comments === undefined) throw new Error('Coluna Comments ausente');
-  const matches=rows.map((row,i)=>({row,i})).filter(x=>x.i>=2 && String(x.row[cols.comments] || '').split(/\s*\|\s*/).includes(`session:${sessionId}`));
-  if(matches.length !== 1) throw new Error('Sessão sem linha única na planilha');
-  return {headers, cols, row:matches[0].row, rowNumber:matches[0].i+1};
-}
-async function correctSession(sheets, spreadsheetId, sessionId, changes) {
-  const found=await findSession(sheets,spreadsheetId,sessionId);
-  for (const change of changes) {
-    const col=found.cols[change.key];
-    if(col === undefined || !['axial_vertical','axial_horizontal','radial_vertical','radial_horizontal'].includes(change.key)) throw new Error('Campo de medição indisponível');
+async function readHistory(sheets, spreadsheetId) {
+  const { data } = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${TAB}!A1:ZZ` });
+  const rows = data.values || [];
+  const schema = mapHeaders(rows);
+  const { cols } = schema;
+  if (['vessel', 'equipment', 'comments'].some(key => cols[key] === undefined)) {
+    throw new Error('Cabeçalhos necessários ausentes ou ambíguos');
   }
-  // Update only the specified cells; avoid overwriting other edits to the row.
-  for(const change of changes) await sheets.spreadsheets.values.update({spreadsheetId,range:`'Modelo alinhamento'!${columnLetter(found.cols[change.key]+1)}${found.rowNumber}`,valueInputOption:'RAW',requestBody:{values:[[change.value]]}});
+  return { rows, ...schema };
+}
+
+function selectRecordTarget(history, data, sessionId) {
+  const { rows, cols, headers, groups } = history;
+  const vessel = normalize(data.vessel);
+  const equipment = equipmentIdentity(data.equipment);
+  if (!isKnown(data.vessel) || !isKnown(data.equipment) || !equipment) return { status: 'identity_missing' };
+  const candidates = [];
+  const sessions = [];
+  let newestRecord = -Infinity;
+  for (let index = 2; index < rows.length; index++) {
+    const row = rows[index];
+    const parts = markerParts(row[cols.comments]);
+    if (normalize(row[cols.vessel]) === vessel) {
+      if (equipmentIdentity(row[cols.equipment]) === equipment) candidates.push(index);
+      for (const part of parts.filter(value => value.startsWith('recorded_at:'))) {
+        const recordedAt = Date.parse(part.slice('recorded_at:'.length));
+        if (Number.isFinite(recordedAt)) newestRecord = Math.max(newestRecord, recordedAt);
+      }
+    }
+    if (parts.includes(`session:${sessionId}`)) sessions.push(index);
+  }
+
+  let index;
+  if (sessions.length > 1) return { status: 'ambiguous_target', rows: sessions.map(i => i + 1) };
+  if (sessions.length === 1) {
+    if (!candidates.includes(sessions[0])) return { status: 'identity_changed' };
+    [index] = sessions;
+  } else if (candidates.length === 1) {
+    [index] = candidates;
+  } else if (candidates.length > 1) {
+    const date = dateIdentity(data.date);
+    const matches = date ? candidates.filter(i => dateIdentity(rows[i][cols.date]) === date) : [];
+    if (matches.length !== 1) return { status: 'ambiguous_target', rows: candidates.map(i => i + 1) };
+    [index] = matches;
+  }
+  if (index === undefined && Date.now() - newestRecord < NEW_EQUIPMENT_INTERVAL_MS) {
+    return { status: 'too_recent' };
+  }
+
+  const current = index === undefined ? {} : Object.fromEntries(
+    Object.entries(cols).map(([key, column]) => [key, rows[index][column] ?? ''])
+  );
+  return {
+    status: 'ready',
+    target: {
+      row: index === undefined ? null : index + 1,
+      revision: digest([vessel, equipment, groups, headers, index, current]),
+      current
+    }
+  };
+}
+
+async function resolveRecordTarget(sheets, spreadsheetId, data, sessionId) {
+  const history = await readHistory(sheets, spreadsheetId);
+  const schema = describeColumns(history.groups, history.headers, history.cols);
+  return { ...selectRecordTarget(history, data, sessionId), schema };
+}
+
+async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, confirmationId } = {}) {
+  if (!target?.revision || !confirmationId) return { status: 'confirmation_required' };
+  const history = await readHistory(sheets, spreadsheetId);
+  const { rows, cols, headers } = history;
+  const marker = `confirmation:${confirmationId}`;
+  const writtenRows = rows.flatMap((row, index) => index >= 2 && markerParts(row[cols.comments]).includes(marker) ? [index + 1] : []);
+  if (writtenRows.length === 1) return { status: 'unchanged', row: writtenRows[0] };
+  if (writtenRows.length > 1) return { status: 'ambiguous_target', rows: writtenRows };
+
+  const selected = selectRecordTarget(history, data, sessionId);
+  if (selected.status !== 'ready') return selected;
+  if (selected.target.revision !== target.revision || selected.target.row !== target.row) {
+    return { status: 'target_changed' };
+  }
+  const { row, current } = selected.target;
+  const commentParts = markerParts(current.comments);
+  const observations = String(data.observations || '').replaceAll('|', '¦').trim();
+  for (const part of [observations && `Observações: ${observations}`, `session:${sessionId}`, marker]) {
+    if (part && !commentParts.includes(part)) commentParts.push(part);
+  }
+  if (row === null) commentParts.push(`recorded_at:${new Date().toISOString()}`);
+  const values = Object.entries(cols).flatMap(([key, column]) => {
+    const value = key === 'comments' ? commentParts.join(' | ') : data[key];
+    if (row === null) {
+      return [{ column, value: String(isKnown(value) ? value : 'não informado') }];
+    }
+    if (!isKnown(value)) {
+      if (isKnown(current[key]) || normalize(current[key]) === 'nao informado') return [];
+      return [{ column, value: 'não informado' }];
+    }
+    if (String(current[key]) === String(value)) return [];
+    return [{ column, value: String(value) }];
+  });
+
+  if (row === null) {
+    const newValues = Array(headers.length).fill('');
+    for (const { column, value } of values) newValues[column] = value;
+    const { data: appended } = await sheets.spreadsheets.values.append({
+      spreadsheetId, range: `${TAB}!A2:${columnLetter(headers.length)}`,
+      valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [newValues] }
+    });
+    const updatedRange = appended.updates?.updatedRange;
+    return { status: 'appended', row: Number(updatedRange?.match(/!\$?[A-Z]+\$?(\d+)/)?.[1]) || undefined };
+  }
+
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      valueInputOption: 'RAW',
+      data: values.map(({ column, value }) => ({
+        range: `${TAB}!${columnLetter(column + 1)}${row}`, values: [[value]]
+      }))
+    }
+  });
+  return { status: 'updated', row };
 }
 
 function columnLetter(number) {
@@ -180,6 +223,6 @@ function columnLetter(number) {
   return result;
 }
 
-module.exports = { mapHeaders, makeRow, getRecordSchema, recordHistory, mergeKnownFields, findSession, correctSession };
+module.exports = { mapHeaders, getRecordSchema, resolveRecordTarget, recordHistory, isKnown, equipmentIdentity, sameEquipment, userComments, mergeKnownFields };
 
 

@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const extraction = require('../gemini_conversation');
+const history = require('../alignment_history');
 
 test('relatório com quatro geradores gera propostas sem gravar antes da validação', async () => {
   let onExtract;
@@ -22,14 +23,15 @@ test('relatório com quatro geradores gera propostas sem gravar antes da valida�
     }}), parseCorrection: () => [], isApproval: () => false},
     './alignment_config': { loadAlignmentConfig: async () => ({}) },
     './alignment_history': {
-      getRecordSchema: async () => [
+      ...history,
+      resolveRecordTarget: async (_sheets, _id, _data, sessionId) => ({status:'ready', target:{row:3, revision:sessionId, current:{}}, schema:[
         {title:'Vessel',group:'',mappedAs:['vessel']},
         {title:'Equipment / Tag',group:'',mappedAs:['equipment']},
         {title:'Data',group:'History',mappedAs:['date']},
         {title:'Maker',group:'Drive Machine',mappedAs:['maker']},
         {title:'Maker',group:'Máquina Estacionária',mappedAs:['stationary_maker']},
         {title:'Axial Vertical',group:'History',mappedAs:['axial_vertical']}
-      ],
+      ]}),
       recordHistory: async (_sheets, _id, data, sessionId) => { writes.push({data,sessionId}); return {status:'appended'}; }
     }
   };

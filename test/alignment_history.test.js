@@ -1,62 +1,100 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { mapHeaders, makeRow, mergeKnownFields, recordHistory } = require('../alignment_history');
+const { mapHeaders, recordHistory, resolveRecordTarget } = require('../alignment_history');
 
-test('completa campos desconhecidos sem sobrescrever dados e sinaliza divergências', () => {
-  const merged = mergeKnownFields({ vessel: 'BRAM Atlas', equipment: 'não informado', axial: '0,02' },
-    { vessel: 'BRAM Atlas', equipment: 'MCP1', axial: '0,03', date: null });
-  assert.deepEqual(merged.fields, { vessel: 'BRAM Atlas', equipment: 'MCP1', axial: '0,02' });
-  assert.deepEqual(merged.conflicts, ['axial']);
-});
-
-test('atualiza os campos desconhecidos na mesma linha da sessão', async () => {
-  const rows = [
-    ['Drive Machine', '', 'Histórico', 'Reference'],
-    ['Vessel', 'Equipment / Tag', 'Data', 'Comments']
-  ];
-  let updated;
+const heads = [
+  ['Drive Machine', '', '', 'Histórico', '', 'Reference'],
+  ['Vessel', 'Equipment / Tag', 'Maker', 'Data', 'Axial Vertical', 'Comments', 'Extra']
+];
+function fakeSheet(...records) {
+  const rows = [...heads, ...records];
+  const writes = [];
   const sheets = { spreadsheets: { values: {
     get: async () => ({ data: { values: rows } }),
-    append: async ({ requestBody }) => {
-      rows.push(requestBody.values[0]);
-      return { data: { updates: { updatedRange: "'Modelo alinhamento'!A3:D3" } } };
+    batchUpdate: async ({ requestBody }) => {
+      writes.push({ type: 'update', ranges: requestBody.data.map(item => item.range) });
+      for (const { range, values } of requestBody.data) {
+        const [, col, row] = range.match(/!([A-G])(\d+)$/);
+        rows[Number(row) - 1][col.charCodeAt(0) - 65] = values[0][0];
+      }
     },
-    update: async ({ requestBody }) => {
-      updated = requestBody.values[0];
-      rows[2] = updated;
-      return { data: { updatedRange: "'Modelo alinhamento'!A3:D3" } };
+    append: async ({ requestBody, insertDataOption }) => {
+      assert.equal(insertDataOption, 'INSERT_ROWS');
+      writes.push({ type: 'append' });
+      rows.push(requestBody.values[0]);
+      return { data: { updates: { updatedRange: `'Modelo alinhamento'!A${rows.length}:G${rows.length}` } } };
     }
   } } };
-  await recordHistory(sheets, 'test', { vessel: 'BRAM Atlas', equipment: null, date: null }, 'session-1');
-  const result = await recordHistory(sheets, 'test', { vessel: 'BRAM Atlas', equipment: 'DG1', date: '2026-11-14' }, 'session-1');
-  assert.equal(result.status, 'updated');
-  assert.deepEqual(updated.slice(0, 3), ['BRAM Atlas', 'DG1', '2026-11-14']);
-  assert.match(updated[3], /session:session-1/);
+  const find = (data, session) => resolveRecordTarget(sheets, 'test', data, session);
+  const write = (data, session, target, confirmationId = 'validado') =>
+    recordHistory(sheets, 'test', data, session, { target, confirmationId });
+  return { rows, writes, find, write };
+}
+
+test('atualiza a linha existente do mesmo equipamento mesmo depois de várias horas', async () => {
+  const h = fakeSheet(['BRAM Atlas', 'DG 1', 'WEG', '18/11/2026', '0.3 mm', 'Nota anterior', '=1+2']);
+  const data = { vessel:'BRAM Atlas', equipment:'Diesel Generator #1', axial_vertical:'-0.01 mm', observations:'Unidade em mm' };
+  const { target } = await h.find(data, 'nova-sessao');
+  assert.equal(target.row, 3);
+  assert.equal(target.current.maker, 'WEG');
+  const result = await h.write(data, 'nova-sessao', target);
+  assert.deepEqual(result, { status:'updated', row:3 });
+  assert.equal(h.rows.length, 3);
+  assert.deepEqual(h.writes[0].ranges, ["'Modelo alinhamento'!B3", "'Modelo alinhamento'!E3", "'Modelo alinhamento'!F3"]);
+  assert.equal(h.rows[2][6], '=1+2');
+  assert.match(h.rows[2][5], /Nota anterior \| Observações: Unidade em mm/);
 });
 
-test('preenche outros campos vazios e preserva o conhecido quando há conflito', async () => {
-  const rows = [
-    ['Drive Machine', '', 'Histórico', 'Reference'],
-    ['Vessel', 'Equipment / Tag', 'Data', 'Comments'],
-    ['BRAM Atlas', 'DG1', 'não informado', 'session:session-conflict']
-  ];
-  let updated;
-  const sheets = { spreadsheets: { values: {
-    get: async () => ({ data: { values: rows } }),
-    update: async ({ requestBody }) => {
-      updated = requestBody.values[0];
-      rows[2] = updated;
-      return { data: { updatedRange: "'Modelo alinhamento'!A3:D3" } };
-    }
-  } } };
+test('só cria linha depois da confirmação de outro equipamento e evita duplicar no retry', async () => {
+  const h = fakeSheet(['BRAM Atlas', 'DG 1', '', '', '', 'session:old | recorded_at:2020-01-01T12:00:00Z']);
+  const data = { vessel:'BRAM Atlas', equipment:'DG 2', axial_vertical:'0' };
+  const { target } = await h.find(data, 'novo');
+  assert.equal(target.row, null);
+  assert.equal((await h.write(data, 'novo')).status, 'confirmation_required');
+  assert.equal(h.writes.length, 0);
+  assert.deepEqual(await h.write(data, 'novo', target), {status:'appended', row:4});
+  assert.equal(h.rows[3][4], '0');
+  assert.deepEqual(await h.write(data, 'novo', target), {status:'unchanged', row:4});
+  assert.equal(h.writes.length, 1);
+});
 
-  const result = await recordHistory(sheets, 'test', {
-    vessel: 'BRAM Brasil', equipment: 'DG2', date: '2026-11-14'
-  }, 'session-conflict');
+test('equipamento diferente na mesma embarcação aguarda o intervalo, mas o mesmo atualiza', async () => {
+  const h = fakeSheet(['BRAM Atlas', 'DG 1', '', '', '', `recorded_at:${new Date().toISOString()}`]);
+  const vessel = 'BRAM Atlas';
+  assert.equal((await h.find({vessel, equipment:'DG 2'}, 'outra')).status, 'too_recent');
+  assert.equal((await h.find({vessel, equipment:'DG 1'}, 'atual')).target.row, 3);
+  assert.equal((await h.find({vessel:'BRAM Brasil', equipment:'DG 2'}, 'outra')).target.row, null);
+  assert.equal(h.writes.length, 0);
+});
 
-  assert.equal(result.status, 'conflict');
-  assert.deepEqual(updated.slice(0, 3), ['BRAM Atlas', 'DG1', '2026-11-14']);
-  assert.match(updated[3], /Conflito para revisão: Vessel, Equipment \/ Tag/);
+test('não cria linha se o destino original sumir ou mudar após a conferência', async () => {
+  const h = fakeSheet(['BRAM Atlas', 'MCP 1', 'WEG', '', '0.03 mm']);
+  const data = {vessel:'BRAM Atlas', equipment:'MCP 1', axial_vertical:'0.02 mm'};
+  const { target } = await h.find(data, 'sessao');
+  h.rows[2][4] = '0.04 mm';
+  assert.equal((await h.write(data, 'sessao', target)).status, 'target_changed');
+  h.rows.pop();
+  assert.equal((await h.write(data, 'sessao', target)).status, 'target_changed');
+  assert.equal(h.writes.length, 0);
+});
+
+test('não cria outra linha se o equipamento passou a existir depois da proposta', async () => {
+  const h = fakeSheet();
+  const data = {vessel:'BRAM Atlas', equipment:'MCP 1'};
+  const { target } = await h.find(data, 'sessao');
+  h.rows.push(['BRAM Atlas', 'MCP 1', 'WEG', '', '0.04 mm']);
+  assert.equal((await h.write(data, 'sessao', target)).status, 'target_changed');
+  assert.equal(h.writes.length, 0);
+});
+
+test('linhas históricas duplicadas exigem data completa e única', async () => {
+  const h = fakeSheet(['BRAM Atlas', 'MCP 1', '', '17/11/2026'],
+    ['BRAM Atlas', 'MCP 1', '', '18/11/2026']);
+  const data = {vessel:'BRAM Atlas', equipment:'MCP 1'};
+  assert.equal((await h.find(data, 'sessao')).status, 'ambiguous_target');
+  assert.equal((await h.find({...data, date:'2026-11-18'}, 'sessao')).target.row, 4);
+  assert.equal((await h.find({...data, date:'18/11'}, 'sessao')).status, 'ambiguous_target');
+  assert.equal(h.writes.length, 0);
 });
 
 test('mapeia títulos por nomes e distingue colunas repetidas pelo grupo', () => {
@@ -68,73 +106,6 @@ test('mapeia títulos por nomes e distingue colunas repetidas pelo grupo', () =>
   assert.equal(mapped.cols.maker, 3);
   assert.equal(mapped.cols.stationary_maker, 20);
   assert.equal(mapped.cols.comments, 23);
-  const row = makeRow(24, mapped.cols, { vessel: 'V', equipment: 'DG1' }, 'abc');
-  assert.equal(row[0], 'V');
-  assert.equal(row[1], 'DG1');
-  assert.equal(row[5], 'não informado');
-  assert.match(row[23], /^session:abc \| recorded_at:/);
-});
-
-test('grava nova linha a partir da coluna A mesmo com dados isolados à direita', async () => {
-  const rows = [
-    ['Drive Machine', '', 'Reference'],
-    ['Vessel', 'Equipment / Tag', 'Comments'],
-    ['Navio', 'MCP', 'session:anterior'],
-    Array(17).fill('').concat('dado isolado')
-  ];
-  let written;
-  const sheets = { spreadsheets: { values: {
-    get: async () => ({ data: { values: rows } }),
-    update: async request => { written = request; return { data: { updatedRange: request.range } }; }
-  } } };
-  await recordHistory(sheets, 'test', {vessel:'Outro navio', equipment:'DG 1'}, 'nova');
-  assert.equal(written.range, "'Modelo alinhamento'!A5:C5");
-  assert.deepEqual(written.requestBody.values[0].slice(0, 2), ['Outro navio', 'DG 1']);
-  assert.match(written.requestBody.values[0][2], /^session:nova \| recorded_at:/);
-});
-
-test('não cria outra linha para o mesmo equipamento dentro de duas horas', async () => {
-  const recordedAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-  const rows = [
-    ['Drive Machine', '', 'History', 'Reference'],
-    ['Vessel', 'Equipment / Tag', 'Data', 'Comments'],
-    ['BRAM Atlas', 'DG 1', 'não informado', `session:old | recorded_at:${recordedAt}`]
-  ];
-  let written;
-  const sheets = {spreadsheets:{values:{
-    get:async()=>({data:{values:rows}}),
-    update:async request=>{written=request;return {data:{updatedRange:request.range}};}
-  }}};
-  const result = await recordHistory(sheets,'test',{vessel:'BRAM Atlas',equipment:'Diesel Generator #1',date:'17/11/2026',recordedAt:new Date().toISOString()},'new-session');
-  assert.equal(result.status,'deduplicated');
-  assert.equal(result.row,3);
-  assert.equal(written.range,"'Modelo alinhamento'!A3:D3");
-  assert.match(written.requestBody.values[0][3],/session:new-session/);
-});
-
-test('aplica correção explicitamente validada sobre valor já preenchido', async () => {
-  const rows=[['Drive Machine','','History','Reference'],['Vessel','Equipment / Tag','Axial Vertical','Comments'],
-    ['BRAM Atlas','MCP 1','-0.015 mm','session:same']];
-  let written;
-  const sheets={spreadsheets:{values:{get:async()=>({data:{values:rows}}),update:async request=>{
-    written=request;return {data:{updatedRange:request.range}};
-  }}}};
-  const result=await recordHistory(sheets,'test',{vessel:'BRAM Atlas',equipment:'MCP 1',axial_vertical:'-0.01 mm'},'same',
-    {overwriteFields:['axial_vertical']});
-  assert.equal(result.status,'updated');
-  assert.equal(written.requestBody.values[0][2],'-0.01 mm');
-});
-
-
-
-test('correção atualiza somente a linha identificada pela sessão e recusa duplicidade', async () => {
-  const {correctSession}=require('../alignment_history');
-  let writes=[]; let rows=[['Drive Machine',null,'Historico de alinhamento',null,'Reference'],['Vessel','Equipment / Tag','Axial Vertical','Axial Horizontal','Comments'],['Joe','MCP 1','não informado','-0.02 mm','session:a'],['Joe','MCP 2','0.3 mm','0.1 mm','session:b']];
-  const sheets={spreadsheets:{values:{get:async()=>({data:{values:rows}}),update:async input=>{writes.push(input);return {data:{}};}}}};
-  await correctSession(sheets,'id','a',[{key:'axial_vertical',value:'-0.01 mm'}]);
-  assert.equal(writes.length,1); assert.equal(writes[0].range,"'Modelo alinhamento'!C3");
-  assert.equal(writes[0].requestBody.values[0][0],'-0.01 mm');
-  rows.push(['Joe','MCP 3','','','session:a']);
-  await assert.rejects(correctSession(sheets,'id','a',[{key:'axial_vertical',value:'1 mm'}]));
-  assert.equal(writes.length,1);
+  const onlyStationary = mapHeaders([['Máquina Estacionária'], ['Maker']]);
+  assert.deepEqual(onlyStationary.cols, {stationary_maker:0});
 });

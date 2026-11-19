@@ -90,8 +90,16 @@ let gemini = null;
 let activeSock = null;
 let alignmentConfigPromise = null;
 const groupTitleCache = new Map();
-const {createConfirmations, parseCorrection} = require('./confirmations');
+const {createConfirmations, parseCorrection, isApproval} = require('./confirmations');
+const history = require('./alignment_history');
 const confirmations = createConfirmations(path.join(__dirname, 'alignment-confirmations.json'));
+let confirmationQueue = Promise.resolve();
+
+function serializeConfirmations(operation) {
+  const result = confirmationQueue.then(operation);
+  confirmationQueue = result.catch(() => {});
+  return result;
+}
 const preMentionMessages = new Map();
 const armedGroups = new Map();
 const GROUP_ARM_WINDOW_MS = 2 * 60 * 60 * 1000;
@@ -106,10 +114,9 @@ function jidDigits(value) {
 }
 
 function explicitlyMentionsBot(sock, content) {
-  const own = jidDigits(sock.user?.id || sock.user?.lid);
-  if (!own) return false;
+  const botIds = new Set([sock.user?.id, sock.user?.lid].map(jidDigits).filter(Boolean));
   const mentions = messageContextInfo(content).mentionedJid || [];
-  return mentions.some(jid => jidDigits(jid) === own);
+  return mentions.some(jid => botIds.has(jidDigits(jid)));
 }
 
 function cacheBeforeMention(group, msg) {
@@ -119,10 +126,58 @@ function cacheBeforeMention(group, msg) {
   preMentionMessages.set(group, messages.slice(-60));
 }
 
+async function publishReview(sock, group, sessionId, proposal) {
+  const { data, conflicts } = proposal;
+  const { target: resolved, status, schema } = await history.resolveRecordTarget(sheets, spreadsheetId, data, sessionId);
+  const lostExistingRow = proposal.requireExisting && !resolved?.row;
+  const target = lostExistingRow ? null : resolved;
+  const displayLines = schema.filter(column => column.mappedAs?.length).flatMap(column =>
+    column.mappedAs.map(key => {
+      const repeated = schema.filter(item => item.title === column.title && item.mappedAs?.length).length > 1;
+      const title = repeated ? `${column.title} (${column.group})` : column.title;
+      const value = key === 'comments'
+        ? [history.userComments(target?.current.comments), data.observations].filter(Boolean).join(' | ')
+        : data[key];
+      const previous = target?.current[key];
+      const shown = history.isKnown(value) ? value : history.isKnown(previous) ? `${previous} (mantido)` : 'não informado';
+      return `${title}: ${shown}`;
+    })
+  );
+  if (data.observations && !schema.some(column => column.mappedAs?.includes('comments'))) {
+    displayLines.push(`Observações: ${data.observations}`);
+  }
+  const destination = target?.row ? `Destino: linha ${target.row} já existente.`
+    : target ? 'Destino: nova linha para este equipamento.'
+    : lostExistingRow ? 'A linha existente deixou de ser identificável. Confira a embarcação, o equipamento e a data antes de prosseguir.'
+    : status === 'too_recent' ? 'A última gravação de equipamento nesta embarcação foi há menos de duas horas. Depois desse intervalo, marque o bot para uma nova conferência.'
+    : status === 'identity_missing' ? 'Informe a embarcação e o equipamento para identificar a linha.'
+    : 'A linha ainda não foi identificada com segurança. Confira a embarcação, o equipamento e a data completa.';
+  const text = [
+    'Confira todos os dados do alinhamento antes de gravar na planilha:',
+    destination,
+    ...displayLines,
+    ...conflicts.map(conflict => `Divergência ${conflict.field}: legenda ${conflict.caption || 'não informada'}; imagem ${conflict.visual || 'não legível'}.`),
+    conflicts.length ? 'Ao confirmar, os campos com divergência ainda marcada serão registrados como “usuário passou informação divergente”.' : '',
+    target ? 'Responda diretamente com “confirmo” para validar todos os dados acima.' : '',
+    'Para corrigir ou completar algum dado, responda no formato “Campo: valor”. O bot enviará todos os dados para nova confirmação.'
+  ].filter(Boolean).join('\n');
+  const prompt = confirmations.prepare(group, sessionId, { ...proposal, target: target ?? null, text });
+  if (!prompt) return true;
+  if (!sock) return false;
+  try {
+    const sent = await sock.sendMessage(group, { text: prompt.text });
+    if (!sent?.key?.id) throw new Error('Mensagem sem identificador');
+    confirmations.sent(prompt.key, sent.key.id);
+    return true;
+  } catch {
+    appendPending({groupJid:group, sessionId, reason:'proposta pendente: confirmação não enviada'});
+    return false;
+  }
+}
+
 if (geminiEnabled) {
   const { createTracker, fileStore, makeGeminiFunctions, verifyExtractions } = require('./gemini_conversation');
   const { loadAlignmentConfig } = require('./alignment_config');
-  const history = require('./alignment_history');
   const store = fileStore(sessionsFile);
   alignmentConfigPromise = loadAlignmentConfig(sheets, process.env.CONFIG_SPREADSHEET_ID);
   gemini = makeGeminiFunctions({
@@ -130,12 +185,13 @@ if (geminiEnabled) {
     model: process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite',
     config: alignmentConfigPromise,
     getRecordSchema: () => history.getRecordSchema(sheets, spreadsheetId),
-    onExtract: async (session, reason, extraction, transcript) => {
+    onExtract: (session, reason, extraction, transcript) => serializeConfirmations(async () => {
       const checkedRecords = verifyExtractions(extraction, transcript);
       const proposed = new Set();
       let pending = 0;
       let deliveryFailed = false;
-      const schema = await history.getRecordSchema(sheets, spreadsheetId);
+      const sourceVersion = crypto.createHash('sha256')
+        .update(JSON.stringify(session.messages.map(({id, text}) => [id, text]))).digest('hex');
       const fieldKeys = {
         'Equipment Class':'class', Maker:'maker', Model:'model',
         'Stationary Equipment Class':'stationary_class', 'Stationary Maker':'stationary_maker',
@@ -146,9 +202,6 @@ if (geminiEnabled) {
         'Coupling gap':'coupling_gap', 'Padrão':'standard', 'Axial tolerance':'axial_tolerance',
         'Radial tolerance':'radial_tolerance', 'Coupling gap tolerance':'gap_tolerance'
       };
-      const normalizeEquipment = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-        .toLowerCase().replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
-        .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
       for (const checked of checkedRecords) {
         if (!checked.ok) {
           pending += 1;
@@ -157,9 +210,7 @@ if (geminiEnabled) {
           console.log('Alinhamento mantido para revisão:', checked.reason);
           continue;
         }
-        const equipmentKey = String(checked.equipment).normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-          .toLowerCase().replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
-          .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
+        const equipmentKey = history.equipmentIdentity(checked.equipment);
         if (proposed.has(equipmentKey)) {
           pending += 1;
           appendPending({ groupJid: session.group, startedAt: session.startedAt,
@@ -193,7 +244,7 @@ if (geminiEnabled) {
           if (!line.startsWith('DIVERGENCIA_MEDICAO: ')) continue;
           try {
             const conflict = JSON.parse(line.slice('DIVERGENCIA_MEDICAO: '.length));
-            if ((normalizeEquipment(currentEquipment) === equipmentKey || checkedRecords.length === 1) &&
+            if ((history.equipmentIdentity(currentEquipment) === equipmentKey || checkedRecords.length === 1) &&
                 !conflicts.some(item => item.field === conflict.field)) conflicts.push(conflict);
           } catch {}
         }
@@ -201,43 +252,13 @@ if (geminiEnabled) {
           const key = fieldKeys[conflict.field] || fieldKeys[conflict.field[0]?.toUpperCase() + conflict.field.slice(1)];
           if (key) data[key] = 'usuário passou informação divergente';
         }
-        const shownFields = [];
-        for (const column of schema) {
-          if (!column.mappedAs?.length) continue;
-          for (const mappedAs of column.mappedAs) {
-            const value = mappedAs === 'vessel' ? data.vessel : mappedAs === 'equipment' ? data.equipment : data[mappedAs];
-            const displayTitle = schema.filter(item => item.title === column.title && item.mappedAs?.length).length > 1
-              ? `${column.title} (${column.group})` : column.title;
-            shownFields.push({title:displayTitle, value:value || 'não informado'});
-          }
-        }
-        const displayLines = shownFields.map(item => `${item.title}: ${item.value}`);
-        for (const conflict of conflicts) {
-          displayLines.push(`Divergência ${conflict.field}: legenda ${conflict.caption || 'não informada'}; imagem ${conflict.visual || 'não legível'}.`);
-        }
-        const text = [
-          `O Gemini interpretou o alinhamento de ${data.vessel} — ${data.equipment}. Confira antes de gravar na planilha:`,
-          ...displayLines,
-          conflicts.length ? 'Se confirmar sem corrigir uma divergência, a célula receberá “usuário passou informação divergente”.' : '',
-          'Responda a esta mensagem com “confirmo” para gravar ou informe as correções no formato “Axial Vertical: -0,01 mm”.'
-        ].filter(Boolean).join('\n');
-        const prompt = confirmations.prepare(session.group, sessionId, {
-          data, conflicts, text, startedAt:session.startedAt, messages:session.messages
+        const sent = await publishReview(activeSock, session.group, sessionId, {
+          data, conflicts, sourceVersion, startedAt:session.startedAt
         });
-        if (prompt && activeSock) {
-          try {
-            const sent = await activeSock.sendMessage(session.group, {text:prompt.text});
-            if (!sent?.key?.id) throw new Error('Mensagem sem identificador');
-            confirmations.sent(prompt.key, sent.key.id);
-          } catch (error) {
-            deliveryFailed = true;
-            appendPending({groupJid:session.group, sessionId, reason:'proposta pendente: confirmação não enviada: '+error.message});
-          }
-        }
-        console.log('Interpretação aguardando validação:', checked.equipment);
+        if (!sent) deliveryFailed = true;
       }
       return {proposed:proposed.size, pending, deliveryFailed};
-    }
+    })
   });
 
   alignmentTracker = createTracker({
@@ -291,6 +312,96 @@ if (geminiEnabled) {
   }, 5 * 60 * 1000).unref();
 }
 
+
+async function handleConfirmation(sock, msg, text, quotedId) {
+  const groupJid = msg.key.remoteJid;
+  const messageId = msg.key.id;
+  const confirmation = confirmations.lookup(groupJid, quotedId);
+  if (!confirmation) return false;
+
+  const [key, entry] = confirmation;
+  const reply = async text => {
+    try { await sock.sendMessage(groupJid, { text, quoted: msg }); } catch {}
+  };
+  if (entry.status === 'superseded') {
+    await reply('Responda à última mensagem de conferência do bot. Esta versão foi substituída.');
+    return true;
+  }
+
+  const corrections = parseCorrection(text, entry.conflicts || []);
+  const approved = isApproval(text);
+  if (entry.status === 'answered' && !corrections.length) return true;
+  if (!corrections.length && !approved) {
+    await reply('Responda “confirmo” para validar todos os dados ou indique as correções no formato “Campo: valor”.');
+    return true;
+  }
+
+  const data = { ...entry.data };
+  const sessionId = entry.sessionId;
+  const makeReview = (conflicts = entry.conflicts || []) => publishReview(sock, groupJid, sessionId, {
+    data, conflicts, sourceVersion: entry.sourceVersion, startedAt: entry.startedAt, parentKey: key,
+    requireExisting: Boolean(entry.target?.row || entry.requireExisting) && history.sameEquipment(data, entry.data)
+  });
+  if (!sessionId) {
+    await reply('Esta proposta antiga não pode ser validada. Marque o bot para gerar uma nova conferência.');
+    return true;
+  }
+
+  try {
+    if (corrections.length) {
+      const schema = await history.getRecordSchema(sheets, spreadsheetId);
+      const allowed = new Set(schema.flatMap(column => column.mappedAs || []));
+      if (corrections.some(({ key }) => !allowed.has(key === 'observations' ? 'comments' : key))) {
+        await reply('Uma das correções aponta para um campo sem coluna reconhecida. Confira os nomes apresentados na proposta.');
+        return true;
+      }
+      for (const { key, value } of corrections) data[key] = value;
+      const conflicts = (entry.conflicts || []).filter(conflict =>
+        !corrections.some(change => change.key === parseCorrection(`${conflict.field}: 0 mm`)[0]?.key)
+      );
+      if (await makeReview(conflicts)) {
+        if (messageId) { seenIds.add(messageId); saveSeenIds(); }
+      } else {
+        await reply('Não consegui enviar a proposta corrigida. Responda novamente com as correções para tentar de novo.');
+      }
+      return true;
+    }
+
+    if (!entry.target) {
+      if (entry.target === null) {
+        await reply('Ainda preciso identificar o destino. Confira os dados solicitados na mensagem de conferência.');
+      } else {
+        await makeReview();
+      }
+      return true;
+    }
+
+    const conflictNotes = (entry.conflicts || []).map(item =>
+      `${item.field}: legenda ${item.caption || 'não informada'}; imagem ${item.visual || 'não legível'}`
+    ).join('; ');
+    const result = await history.recordHistory(sheets, spreadsheetId, {
+      ...data,
+      observations: [data.observations, conflictNotes].filter(Boolean).join('; '),
+      groupJid
+    }, sessionId, { target: entry.target, confirmationId: key });
+    if (!['appended', 'updated', 'unchanged'].includes(result.status)) {
+      appendPending({ groupJid, messageId, sessionId, reason: result.status });
+      await reply('A planilha mudou ou o destino ficou indefinido. Confira os dados na nova proposta para liberar a gravação.');
+      if (!await makeReview()) await reply('Não consegui enviar a nova conferência. Tente confirmar novamente.');
+      return true;
+    }
+    confirmations.done(key, messageId);
+    if (messageId) { seenIds.add(messageId); saveSeenIds(); }
+    await reply(result.row ? `Dados validados e gravados na linha ${result.row} da planilha.`
+      : 'Dados validados e gravados na planilha.');
+  } catch (error) {
+    console.error('Falha ao processar confirmação de alinhamento.', error.code || error.status || '');
+    appendPending({ groupJid, messageId, sessionId, reason: 'falha ao processar confirmação' });
+    await reply('Não consegui concluir a confirmação com o Google Sheets. Responda novamente à mensagem de conferência para tentar de novo.');
+  }
+  return true;
+}
+
 async function handleMessage(sock, msg, options = {}) {
   const groupJid = msg.key.remoteJid || '';
   if (!groupJid.endsWith('@g.us') || msg.key.fromMe) return;
@@ -307,68 +418,9 @@ async function handleMessage(sock, msg, options = {}) {
 
   if (geminiEnabled) {
     const contextInfo = messageContextInfo(content);
-    const confirmation = contextInfo?.stanzaId && confirmations.lookup(groupJid, contextInfo.stanzaId);
-    if (confirmation) {
-      const [key, entry] = confirmation;
-      if (entry.status === 'superseded') {
-        if (messageId) { seenIds.add(messageId); saveSeenIds(); }
-        try { await sock.sendMessage(groupJid, {text:'Esta interpretação foi substituída por uma mais recente. Responda à última mensagem de conferência do bot.', quoted:msg}); } catch {}
-        return;
-      }
-      const corrections = parseCorrection(text, entry.conflicts || []);
-      const approved = require('./confirmations').isApproval(text);
-      if (entry.status === 'answered' && !corrections.length) {
-        if (messageId) { seenIds.add(messageId); saveSeenIds(); }
-        return;
-      }
-      if (!corrections.length && !approved) {
-        appendPending({groupJid, messageId, reason:'resposta de validação não reconhecida'});
-        try { await sock.sendMessage(groupJid, {text:'Não consegui identificar a confirmação ou correção. Responda “confirmo” ou informe o campo e o valor, por exemplo: Axial Vertical: -0,01 mm.', quoted:msg}); } catch {}
-        return;
-      }
-      const data = {...entry.data};
-      for (const correction of corrections) data[correction.key] = correction.value;
-      const conflicts = (entry.conflicts || []).filter(conflict => {
-        const correction = corrections.find(item => item.key === parseCorrection(`${conflict.field}: 0`, [])[0]?.key);
-        return !correction;
-      });
-      for (const conflict of conflicts) {
-        const normalized = String(conflict.field || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-        const key = ({'axial vertical':'axial_vertical','axial horizontal':'axial_horizontal',
-          'radial vertical':'radial_vertical','radial horizontal':'radial_horizontal'})[normalized];
-        if (key) data[key] = 'usuário passou informação divergente';
-      }
-      if (!data.vessel || data.vessel === 'não informado' || !data.equipment || data.equipment === 'não informado') {
-        appendPending({groupJid, messageId, reason:'identidade do alinhamento ainda não foi informada com segurança'});
-        try { await sock.sendMessage(groupJid, {text:'Preciso confirmar a embarcação e o equipamento antes de gravar. Responda com “Embarcação: ...” e “Equipamento: ...”.', quoted:msg}); } catch {}
-        return;
-      }
-      const normalizeEquipment = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-        .toLowerCase().replace(/\b(?:diesel generator|diesel gerador|gerador diesel|grupo gerador|genset)\s*#?\s*(\d+)\b/g, 'dg$1')
-        .replace(/\bdg\s*#?\s*(\d+)\b/g, 'dg$1').replace(/[^a-z0-9]/g, '');
-      const sessionId = crypto.createHash('sha256')
-        .update(`${groupJid}|${entry.startedAt}|${normalizeEquipment(data.equipment)}`).digest('hex').slice(0, 24);
-      const conflictNotes = conflicts.map(item => `${item.field}: legenda ${item.caption || 'não informada'}; imagem ${item.visual || 'não legível'}`).join('; ');
-      data.observations = [data.observations, conflictNotes].filter(Boolean).join('; ');
-      data.groupJid = groupJid;
-      data.recordedAt = new Date().toISOString();
-      const overwriteFields = Object.entries(data)
-        .filter(([key, value]) => key !== 'observations' && value != null && String(value).trim() &&
-          String(value).trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase() !== 'nao informado')
-        .map(([key]) => key);
-      const result = await require('./alignment_history').recordHistory(sheets, spreadsheetId, data, sessionId, {overwriteFields});
-      if (!['appended','updated','deduplicated','unchanged'].includes(result.status)) {
-        appendPending({groupJid, messageId, sessionId, result, reason:'não foi possível gravar com segurança após a validação'});
-        try { await sock.sendMessage(groupJid, {text:result.status === 'ambiguous_duplicate'
-          ? 'Encontrei mais de uma linha recente para este mesmo equipamento e não consegui escolher com segurança. Preciso revisar a planilha antes de gravar.'
-          : 'A validação foi recebida, mas a planilha indicou um conflito. O registro ficou pendente para revisão.' , quoted:msg}); } catch {}
-        return;
-      }
-      confirmations.done(key, messageId, 'answered');
-      if (messageId) { seenIds.add(messageId); saveSeenIds(); }
-      try { await sock.sendMessage(groupJid, {text:`Dados validados e gravados na linha ${result.row || 'existente'} da planilha.`, quoted:msg}); } catch {}
-      return;
-    }
+
+    if (contextInfo.stanzaId && await serializeConfirmations(() =>
+      handleConfirmation(sock, msg, text, contextInfo.stanzaId))) return;
 
     const mentioned = explicitlyMentionsBot(sock, content);
     const activeSession = alignmentTracker?.snapshot?.()[groupJid];
@@ -539,18 +591,15 @@ async function recoverAttachment(savedAs) {
   if (existingMessage) existingMessage.text = messageText;
   else session.messages.push({group:entry.groupJid, id:entry.messageId, timestamp,
     sender:'', groupName:entry.groupName, text:messageText});
-  const outcome = await gemini.finish(session, 'recuperação de anexo');
-  const expected = (summary.match(/^Equipamento:/gm) || []).length;
-  if (!outcome || outcome.written < expected || outcome.pending) {
-    throw new Error(`Extração parcial: ${outcome?.written || 0}/${expected} linhas; arquivo mantido para revisão.`);
-  }
-  session.lastAnalyzedMessageCount = session.messages.length;
+  session.lastRelated = Date.now();
+  session.activatedByMention = true;
+  delete session.lastAnalyzedMessageCount;
   sessions[entry.groupJid] = session;
   store.save(sessions);
   if (entry.messageId) { seenIds.add(entry.messageId); saveSeenIds(); }
   appendPending({messageId:entry.messageId, savedAs:entry.savedAs,
-    recoveredAt:new Date().toISOString(), reason:'anexo recuperado e sincronizado'});
-  console.log('Anexo recuperado e sincronizado:', entry.savedAs);
+    recoveredAt:new Date().toISOString(), reason:'anexo recuperado para conferência no WhatsApp'});
+  console.log('Anexo recuperado. A instância do bot deve carregar a sessão para enviar a conferência.');
 }
 
 process.on('SIGINT', () => process.exit(0));

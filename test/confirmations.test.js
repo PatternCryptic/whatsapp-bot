@@ -18,7 +18,9 @@ test('propostas sobrevivem a reinício, isolam grupos e não se repetem',()=>{
 test('correção exige campo e preserva sinal e decimal',()=>{
  assert.deepEqual(parseCorrection('axial vertical: -0,01 mm'),[{key:'axial_vertical',value:'-0.01 mm'}]);
  assert.deepEqual(parseCorrection('sim, 0,01'),[]);
- assert.deepEqual(parseCorrection('0,01',[{field:'Axial Vertical'}]),[{key:'axial_vertical',value:'0.01 mm'}]);
+ assert.deepEqual(parseCorrection('0,01',[{field:'Axial Vertical'}]),[]);
+ assert.deepEqual(parseCorrection('0,01 mm',[{field:'Axial Vertical'}]),[{key:'axial_vertical',value:'0.01 mm'}]);
+ assert.deepEqual(parseCorrection('axial vertical: -2 cm'),[{key:'axial_vertical',value:'-2 cm'}]);
  assert.deepEqual(parseCorrection('Embarcação: Bram Atlas\nEquipment / Tag: MCP 1'),[
    {key:'vessel',value:'Bram Atlas'},{key:'equipment',value:'MCP 1'}
  ]);
@@ -26,6 +28,7 @@ test('correção exige campo e preserva sinal e decimal',()=>{
    {key:'maker',value:'WEG'},{key:'stationary_maker',value:'ABB'}
  ]);
  assert.equal(isApproval('confirmo'),true);
+ assert.equal(isApproval('confirmo?'),false);
  assert.equal(isApproval('sim, correto'),true);
  assert.equal(isApproval('não, axial vertical: -0.01 mm'),false);
 });

@@ -8,21 +8,22 @@ Bot de WhatsApp que só inicia a análise quando alguém menciona o bot em um gr
 - O Gemini considera o texto, o título do grupo, a taxonomia, o glossário e as combinações de máquinas da planilha de configuração.
 - Anexos JPEG, PNG, WebP e PDF são enviados ao Gemini para leitura. Relatórios com vários equipamentos geram uma proposta para cada equipamento. Anexos acima de 20 MB ou em formatos não suportados ficam pendentes para revisão.
 - PDFs com vários geradores recebem uma segunda leitura focada no GAP final de cada conjunto. Folga do virabrequim, pré-GAP e valores anteriores ao alinhamento não entram na coluna `Coupling GAP`.
-- A cada cinco minutos, o Gemini compara as mensagens e os anexos com os cabeçalhos reais da aba `Modelo alinhamento`. Cada campo ausente aparece como `não informado`; a ausência de dados não impede a proposta.
-- O bot apresenta os valores interpretados e aguarda uma resposta. Nenhuma linha é gravada antes da validação. Responda à mensagem do bot com `confirmo` ou corrija os campos no formato `Axial Vertical: -0,01 mm`.
-- Uma correção explícita valida os dados apresentados e é gravada. Se a pessoa confirmar uma divergência entre legenda e imagem sem corrigi-la, a célula recebe `usuário passou informação divergente`; os outros campos validados são gravados normalmente.
+- A cada cinco minutos, o Gemini compara as mensagens e os anexos com os cabeçalhos reais da aba `Modelo alinhamento`. A conferência indica o destino, mostra os campos a gravar, identifica valores mantidos e apresenta o restante como `não informado`. Campos sem valor informado são gravados como `não informado` em linhas novas. Ao atualizar uma linha existente, os valores já conhecidos são preservados e os campos vazios recebem `não informado`.
+- Responda diretamente à mensagem de conferência com `confirmo` para aprovar todos os dados apresentados. Para corrigir ou completar campos, use o formato `Axial Vertical: -0,01 mm`. O bot apresenta a lista completa novamente e aguarda uma nova confirmação.
+- Se a pessoa confirmar os dados com uma divergência entre legenda e imagem ainda marcada, a célula recebe `usuário passou informação divergente` e a diferença fica nas observações.
 - Se embarcação ou equipamento ainda estiverem como `não informado`, o bot pede esses dados e não grava até poder identificar o registro com segurança.
-- Durante duas horas, uma confirmação para a mesma embarcação e equipamento atualiza a linha recente, sem criar outra. Se houver mais de uma linha possível, o bot não escolhe automaticamente e deixa o caso pendente para revisão.
+- O mesmo equipamento na mesma embarcação usa a linha existente, inclusive depois de duas horas. Se houver várias linhas históricas, a sessão ou uma data completa e única identifica a linha. Se o destino ficar ambíguo, ou mudar após a conferência, o bot pede nova validação antes de gravar.
+- Uma linha nova exige equipamento ainda não registrado na embarcação e confirmação explícita da proposta. Aguarde duas horas após a última inclusão identificável do bot para outro equipamento na mesma embarcação. Esse intervalo usa o horário guardado em `Comments` e não se aplica a linhas antigas sem esse horário.
 - Tolerâncias e medições são extraídas separadamente. O código não calcula valores nem conclui aceitabilidade sem dados compatíveis.
 
 ## Planilhas e permissões
 
-- **Registros:** [Mr Alinhamento](https://docs.google.com/spreadsheets/d/1oc2u-thAhflrqEb3m6hxux8Yg6jEE6wGY-zFQyBRR38/edit), aba `Modelo alinhamento`; definir o ID em `SPREADSHEET_ID`.
-- **Referências:** [Configuração - alinhamento](https://docs.google.com/spreadsheets/d/1KroIP08qi3FfpG5JO_aJgl8OHXcZvwBpEP2dL6ZCDKM/edit), abas `Taxonomia`, `Glossario`, `Configurações` e `Masterlist`; definir o ID em `CONFIG_SPREADSHEET_ID`.
+- **Registros:** planilha de alinhamentos, aba `Modelo alinhamento`; definir o ID em `SPREADSHEET_ID`.
+- **Referências:** planilha de configuração, abas `Taxonomia`, `Glossario`, `Configurações` e `Masterlist`; definir o ID em `CONFIG_SPREADSHEET_ID`.
 - A conta de serviço precisa de leitura na planilha de referências e edição na planilha de registros. Na VM, o Google Sheets usa Application Default Credentials da conta anexada; não use chaves privadas no repositório.
 - `GEMINI_API_KEY` deve vir do ambiente ou do gerenciador de segredos. Nunca registre a chave nos logs.
 
-Os cabeçalhos ocupam as linhas 1 e 2 e incluem grupos de colunas. O mapeamento considera o título e o grupo, inclusive para `Maker`, `Model` e `Equipment Class` repetidos. `Comments` contém identificadores de sessão e horário de gravação para manter a identidade da linha e aplicar a janela de duas horas.
+Os cabeçalhos ocupam as linhas 1 e 2 e incluem grupos de colunas. O mapeamento considera o título e o grupo, inclusive para `Maker`, `Model` e `Equipment Class` repetidos. `Comments` guarda observações, identificadores de sessão e de confirmação, e o horário de inclusão de linhas novas.
 
 ## Configuração
 
@@ -44,4 +45,4 @@ IDs processados, sessões, propostas e pendências ficam em arquivos locais priv
 
 ## Verificação
 
-Rode `npm test` para verificar o mapeamento dos cabeçalhos, o preenchimento de desconhecidos, a ativação por menção, as propostas sem gravação prévia, o isolamento das conversas e a trava de duas horas para duplicidade. Use um grupo de teste e um PDF ou imagem com dados fictícios para conferir a leitura e a confirmação antes de testar na planilha operacional.
+Rode `npm test` para verificar a confirmação completa, o destino da gravação, a ativação por menção e a espera de duas horas para incluir outro equipamento. Use um grupo de teste e dados fictícios para conferir a operação no WhatsApp e no Google Sheets.
