@@ -8,7 +8,7 @@ Bot de WhatsApp que só inicia a análise quando alguém menciona o bot em um gr
 - O Gemini considera o texto, o título do grupo, a taxonomia, o glossário e as combinações de máquinas da planilha de configuração.
 - Anexos JPEG, PNG, WebP e PDF são enviados ao Gemini para leitura. Relatórios com vários equipamentos geram uma proposta para cada equipamento. Anexos acima de 20 MB ou em formatos não suportados ficam pendentes para revisão.
 - PDFs com vários geradores recebem uma segunda leitura focada no GAP final de cada conjunto. Folga do virabrequim, pré-GAP e valores anteriores ao alinhamento não entram na coluna `Coupling GAP`.
-- A cada cinco minutos, o Gemini compara as mensagens e os anexos com os cabeçalhos reais da aba `Modelo alinhamento`. A conferência indica o destino, mostra os campos a gravar, identifica valores mantidos e apresenta o restante como `não informado`. Campos sem valor informado são gravados como `não informado` em linhas novas. Ao atualizar uma linha existente, os valores já conhecidos são preservados e os campos vazios recebem `não informado`.
+- A cada cinco minutos, o Gemini compara as mensagens e os anexos com os cabeçalhos reais da aba `Modelo alinhamento`. A conferência indica o destino, mostra os campos a gravar, identifica valores mantidos e apresenta o restante como `não informado`. Campos sem valor informado ficam vazios na planilha.
 - Responda diretamente à mensagem de conferência com `confirmo` para aprovar todos os dados apresentados. Para corrigir ou completar campos, use o formato `Axial Vertical: -0,01 mm`. O bot apresenta a lista completa novamente e aguarda uma nova confirmação.
 - Se a pessoa confirmar os dados com uma divergência entre legenda e imagem ainda marcada, a célula recebe `usuário passou informação divergente` e a diferença fica nas observações.
 - Se embarcação ou equipamento ainda estiverem como `não informado`, o bot pede esses dados e não grava até poder identificar o registro com segurança.
@@ -18,8 +18,10 @@ Bot de WhatsApp que só inicia a análise quando alguém menciona o bot em um gr
 
 ## Planilhas e permissões
 
-- **Registros:** planilha de alinhamentos, aba `Modelo alinhamento`; definir o ID em `SPREADSHEET_ID`.
-- **Referências:** planilha de configuração, abas `Taxonomia`, `Glossario`, `Configurações` e `Masterlist`; definir o ID em `CONFIG_SPREADSHEET_ID`.
+Quando houver linhas da mesma embarcação com `Equipment / Tag` vazio, o bot pede esclarecimento antes de criar uma linha. A mensagem lista as linhas candidatas. Responda diretamente à proposta, por exemplo, com `Linha da planilha: 3`, depois de conferir o equipamento na base. O bot valida a embarcação e a identificação existente, reapresenta todos os dados e aguarda `confirmo`. A indicação da linha, por si só, não grava os dados.
+
+- **Registros:** [Mr Alinhamento](https://docs.google.com/spreadsheets/d/1oc2u-thAhflrqEb3m6hxux8Yg6jEE6wGY-zFQyBRR38/edit), aba `Modelo alinhamento`; definir o ID em `SPREADSHEET_ID`.
+- **Referências:** [Configuração - alinhamento](https://docs.google.com/spreadsheets/d/1KroIP08qi3FfpG5JO_aJgl8OHXcZvwBpEP2dL6ZCDKM/edit), abas `Taxonomia`, `Glossario`, `Configurações` e `Masterlist`; definir o ID em `CONFIG_SPREADSHEET_ID`.
 - A conta de serviço precisa de leitura na planilha de referências e edição na planilha de registros. Na VM, o Google Sheets usa Application Default Credentials da conta anexada; não use chaves privadas no repositório.
 - `GEMINI_API_KEY` deve vir do ambiente ou do gerenciador de segredos. Nunca registre a chave nos logs.
 

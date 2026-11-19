@@ -128,7 +128,7 @@ function cacheBeforeMention(group, msg) {
 
 async function publishReview(sock, group, sessionId, proposal) {
   const { data, conflicts } = proposal;
-  const { target: resolved, status, schema } = await history.resolveRecordTarget(sheets, spreadsheetId, data, sessionId);
+  const { target: resolved, status, schema, rows: candidateRows } = await history.resolveRecordTarget(sheets, spreadsheetId, data, sessionId);
   const lostExistingRow = proposal.requireExisting && !resolved?.row;
   const target = lostExistingRow ? null : resolved;
   const displayLines = schema.filter(column => column.mappedAs?.length).flatMap(column =>
@@ -149,6 +149,8 @@ async function publishReview(sock, group, sessionId, proposal) {
   const destination = target?.row ? `Destino: linha ${target.row} já existente.`
     : target ? 'Destino: nova linha para este equipamento.'
     : lostExistingRow ? 'A linha existente deixou de ser identificável. Confira a embarcação, o equipamento e a data antes de prosseguir.'
+    : ['unidentified_existing', 'invalid_row'].includes(status)
+      ? `Há linhas sem identificação de equipamento nesta embarcação${candidateRows?.length ? ` (${candidateRows.join(', ')})` : ''}. Qual delas corresponde a ${data.equipment}? Responda “Linha da planilha: número”. Confira a classe, fabricante e modelo na base antes de indicar a linha.`
     : status === 'too_recent' ? 'A última gravação de equipamento nesta embarcação foi há menos de duas horas. Depois desse intervalo, marque o bot para uma nova conferência.'
     : status === 'identity_missing' ? 'Informe a embarcação e o equipamento para identificar a linha.'
     : 'A linha ainda não foi identificada com segurança. Confira a embarcação, o equipamento e a data completa.';
@@ -351,7 +353,7 @@ async function handleConfirmation(sock, msg, text, quotedId) {
     if (corrections.length) {
       const schema = await history.getRecordSchema(sheets, spreadsheetId);
       const allowed = new Set(schema.flatMap(column => column.mappedAs || []));
-      if (corrections.some(({ key }) => !allowed.has(key === 'observations' ? 'comments' : key))) {
+      if (corrections.some(({ key }) => key !== 'existingRow' && !allowed.has(key === 'observations' ? 'comments' : key))) {
         await reply('Uma das correções aponta para um campo sem coluna reconhecida. Confira os nomes apresentados na proposta.');
         return true;
       }

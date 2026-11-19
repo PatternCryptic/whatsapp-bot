@@ -109,12 +109,14 @@ function selectRecordTarget(history, data, sessionId) {
   if (!isKnown(data.vessel) || !isKnown(data.equipment) || !equipment) return { status: 'identity_missing' };
   const candidates = [];
   const sessions = [];
+  const unidentifiedRows = [];
   let newestRecord = -Infinity;
   for (let index = 2; index < rows.length; index++) {
     const row = rows[index];
     const parts = markerParts(row[cols.comments]);
     if (normalize(row[cols.vessel]) === vessel) {
       if (equipmentIdentity(row[cols.equipment]) === equipment) candidates.push(index);
+      if (!isKnown(row[cols.equipment])) unidentifiedRows.push(index);
       for (const part of parts.filter(value => value.startsWith('recorded_at:'))) {
         const recordedAt = Date.parse(part.slice('recorded_at:'.length));
         if (Number.isFinite(recordedAt)) newestRecord = Math.max(newestRecord, recordedAt);
@@ -124,17 +126,30 @@ function selectRecordTarget(history, data, sessionId) {
   }
 
   let index;
+  if (data.existingRow !== undefined) {
+    const requested = Number(data.existingRow) - 1;
+    if (!Number.isInteger(requested) || requested < 2 || !rows[requested] ||
+        normalize(rows[requested][cols.vessel]) !== vessel ||
+        (!unidentifiedRows.includes(requested) && !candidates.includes(requested))) {
+      return { status: 'invalid_row', rows: unidentifiedRows.map(i => i + 1) };
+    }
+    index = requested;
+  }
   if (sessions.length > 1) return { status: 'ambiguous_target', rows: sessions.map(i => i + 1) };
   if (sessions.length === 1) {
     if (!candidates.includes(sessions[0])) return { status: 'identity_changed' };
+    if (index !== undefined && index !== sessions[0]) return { status: 'identity_changed' };
     [index] = sessions;
-  } else if (candidates.length === 1) {
+  } else if (index === undefined && candidates.length === 1) {
     [index] = candidates;
-  } else if (candidates.length > 1) {
+  } else if (index === undefined && candidates.length > 1) {
     const date = dateIdentity(data.date);
     const matches = date ? candidates.filter(i => dateIdentity(rows[i][cols.date]) === date) : [];
     if (matches.length !== 1) return { status: 'ambiguous_target', rows: candidates.map(i => i + 1) };
     [index] = matches;
+  }
+  if (index === undefined && unidentifiedRows.length) {
+    return { status: 'unidentified_existing', rows: unidentifiedRows.map(i => i + 1) };
   }
   if (index === undefined && Date.now() - newestRecord < NEW_EQUIPMENT_INTERVAL_MS) {
     return { status: 'too_recent' };
@@ -181,15 +196,9 @@ async function recordHistory(sheets, spreadsheetId, data, sessionId, { target, c
   }
   if (row === null) commentParts.push(`recorded_at:${new Date().toISOString()}`);
   const values = Object.entries(cols).flatMap(([key, column]) => {
+    if (['document', 'class', 'maker', 'model', 'stationary_class', 'stationary_maker', 'stationary_model'].includes(key)) return [];
     const value = key === 'comments' ? commentParts.join(' | ') : data[key];
-    if (row === null) {
-      return [{ column, value: String(isKnown(value) ? value : 'não informado') }];
-    }
-    if (!isKnown(value)) {
-      if (isKnown(current[key]) || normalize(current[key]) === 'nao informado') return [];
-      return [{ column, value: 'não informado' }];
-    }
-    if (String(current[key]) === String(value)) return [];
+    if (!isKnown(value) || (row && String(current[key]) === String(value))) return [];
     return [{ column, value: String(value) }];
   });
 
